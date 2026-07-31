@@ -1,0 +1,829 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <script src="forge-sharepoint-sync.js"></script>
+    <script src="devconsole.js"></script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>tbl_SS_Actions</title>
+    <style>
+        :root {
+            --primary-color: #005a9c;
+            --secondary-color: #f0f0f0;
+            --border-color: #ccc;
+            --hover-color: #e0e0e0;
+            --button-bg: #007bff;
+            --button-hover-bg: #0056b3;
+            --danger-bg: #dc3545;
+            --danger-hover-bg: #c82333;
+            --warning-bg: #ffc107;
+            --warning-text: #212529;
+            --font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        }
+        body {
+            font-family: var(--font-family);
+            background-color: var(--secondary-color);
+            margin: 0;
+            padding: 20px;
+            font-size: 14px;
+        }
+        h1 {
+            color: var(--primary-color);
+            text-align: center;
+            margin-top: 0;
+        }
+        .container {
+            max-width: 95%;
+            margin: auto;
+            background: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+
+        /* Nav tabs */
+        .nav-tabs {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 20px;
+            border-bottom: 2px solid var(--primary-color);
+        }
+        .nav-tab {
+            padding: 12px 24px;
+            border: 1px solid var(--border-color);
+            border-bottom: none;
+            border-radius: 6px 6px 0 0;
+            background: #e9ecef;
+            color: #333;
+            cursor: pointer;
+            font-size: 15px;
+            font-weight: bold;
+        }
+        .nav-tab:hover {
+            background: var(--hover-color);
+        }
+        .nav-tab.active {
+            background: var(--primary-color);
+            color: #fff;
+        }
+
+        /* Views */
+        .view { display: none; }
+        .view.active { display: block; }
+
+        #sync-status {
+            padding: 8px 12px;
+            background-color: #6c757d;
+            color: white;
+            border-radius: 4px;
+            margin-bottom: 20px;
+            text-align: center;
+            font-weight: bold;
+            transition: background-color 0.3s;
+        }
+
+        /* Filter bar */
+        .filter-bar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 14px;
+            align-items: flex-end;
+            margin-bottom: 15px;
+            padding: 15px;
+            background: #f8f9fa;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+        }
+        .filter-group {
+            display: flex;
+            flex-direction: column;
+            min-width: 170px;
+        }
+        .filter-group.search-group {
+            min-width: 240px;
+            flex-grow: 1;
+        }
+        .filter-group label {
+            font-size: 11px;
+            font-weight: bold;
+            margin-bottom: 4px;
+            color: #555;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+        }
+        .filter-group input,
+        .filter-group select {
+            padding: 8px;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        .filter-actions {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            margin-left: auto;
+        }
+        .ticket-count {
+            font-weight: bold;
+            color: #555;
+            white-space: nowrap;
+        }
+        .btn-clear {
+            background-color: #6c757d;
+        }
+        .btn-clear:hover {
+            background-color: #5a6268;
+        }
+
+        .table-container {
+            width: 100%;
+            overflow-x: auto;
+            max-height: 65vh;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            margin-bottom: 20px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th,
+        td {
+            padding: 10px 12px;
+            border: 1px solid var(--border-color);
+            text-align: left;
+            white-space: nowrap;
+            max-width: 320px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        thead th {
+            background-color: var(--primary-color);
+            color: white;
+            position: sticky;
+            top: 0;
+            z-index: 2;
+        }
+        thead th:first-child,
+        tbody td:first-child {
+            position: sticky;
+            left: 0;
+            background-color: #f8f9fa;
+            z-index: 1;
+        }
+        thead th:first-child {
+             background-color: var(--primary-color);
+        }
+        tbody tr:hover {
+            background-color: var(--hover-color);
+        }
+        tbody tr {
+            cursor: pointer;
+        }
+        tr.has-conflict {
+            background-color: #fff3cd;
+        }
+        tr.has-conflict:hover {
+            background-color: #ffeeba;
+        }
+        .status-pill {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+            color: #fff;
+            background: #6c757d;
+            white-space: nowrap;
+        }
+        .status-Closed { background: #28a745; }
+        .status-Approved { background: #007bff; }
+        .status-Cancelled { background: #6c757d; }
+        .status-Returned { background: #dc3545; }
+        .priority-pill {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+            white-space: nowrap;
+            background: var(--secondary-color);
+            color: #333;
+            border: 1px solid var(--border-color);
+        }
+        .priority-Workstop { background: #dc3545; color: #fff; border-color: #dc3545; }
+        .priority-Urgent-Critical-Chain { background: #ffc107; color: #212529; border-color: #ffc107; }
+        .priority-Safety { background: #fd7e14; color: #fff; border-color: #fd7e14; }
+
+        .actions {
+            display: flex;
+            gap: 10px;
+        }
+        button {
+            padding: 8px 12px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            color: white;
+            font-size: 14px;
+            font-weight: bold;
+        }
+        .btn-add {
+            background-color: #28a745;
+            margin-bottom: 15px;
+        }
+        .btn-add:hover {
+            background-color: #218838;
+        }
+        .btn-edit {
+            background-color: #ffc107;
+            color: #212529;
+        }
+        .btn-edit:hover {
+            background-color: #e0a800;
+        }
+        .btn-remove {
+            background-color: var(--danger-bg);
+        }
+        .btn-remove:hover {
+            background-color: var(--danger-hover-bg);
+        }
+        .btn-save {
+            background-color: var(--button-bg);
+        }
+        .btn-save:hover {
+            background-color: var(--button-hover-bg);
+        }
+        .btn-cancel {
+            background-color: #6c757d;
+        }
+        .btn-cancel:hover {
+            background-color: #5a6268;
+        }
+        .btn-back {
+            background-color: #6c757d;
+            margin-bottom: 15px;
+        }
+        .btn-back:hover {
+            background-color: #5a6268;
+        }
+
+        /* Edit page (full page, not a modal) */
+        .edit-page-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--border-color);
+            margin-bottom: 20px;
+        }
+        .edit-page-header h2 {
+            margin: 0;
+        }
+        #item-form-container {
+            max-height: 68vh;
+            overflow-y: auto;
+            padding-right: 15px;
+        }
+        .form-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            gap: 15px;
+        }
+        .form-group {
+            display: flex;
+            flex-direction: column;
+        }
+        .form-group.full-width {
+            grid-column: 1 / -1;
+        }
+        .form-group label {
+            margin-bottom: 5px;
+            font-weight: bold;
+            color: #333;
+        }
+        .form-group input,
+        .form-group textarea {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            box-sizing: border-box;
+            font-family: inherit;
+        }
+        .form-group textarea {
+            resize: vertical;
+        }
+
+        .conflict-section {
+            margin-top: 15px;
+            padding: 10px;
+            background-color: #fff3cd;
+            border: 1px solid #ffeeba;
+            border-radius: 4px;
+        }
+        .conflict-section h4 {
+            margin-top: 0;
+            color: var(--warning-text);
+        }
+
+        .conflict-section pre {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            background: #fff;
+            padding: 5px;
+            border-radius: 3px;
+        }
+        .form-actions {
+            margin-top: 20px;
+            padding-top: 20px;
+            border-top: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            gap: 10px;
+        }
+        .form-actions-left,
+        .form-actions-right {
+            display: flex;
+            gap: 10px;
+        }
+
+        /* Metrics placeholder */
+        .metrics-placeholder {
+            text-align: center;
+            padding: 80px 20px;
+            color: #6c757d;
+        }
+        .metrics-placeholder .icon {
+            font-size: 48px;
+            margin-bottom: 10px;
+        }
+        .metrics-placeholder h2 {
+            color: var(--primary-color);
+            margin-bottom: 8px;
+        }
+    </style>
+</head>
+<body>
+<!-- WCT-UNSHIPPED-BANNER:START -->
+<div id="wct-unshipped-banner" style="background:linear-gradient(90deg,#c0392b,#e74c3c);color:#fff;padding:5px 12px;font-family:system-ui,-apple-system,sans-serif;font-weight:bold;font-size:12px;line-height:1.2;position:fixed;top:0;left:0;right:0;z-index:999999;box-shadow:0 1px 4px rgba(0,0,0,0.25);display:flex;align-items:center;justify-content:center;gap:12px;min-height:34px;box-sizing:border-box;">
+  <span>&#9888;&#65039; Not Secured &ndash; Ship in Forge before entering CUI/sensitive data</span>
+  <span style="display:inline-flex;gap:6px;flex:none;">
+    <button type="button" id="wct-devconsole-button" title="Open Dev Console" style="border:1px solid rgba(255,255,255,.7);border-radius:4px;background:#20252b;color:#fff;padding:3px 8px;font:700 11px/1.2 system-ui,-apple-system,sans-serif;cursor:pointer;">Dev Console</button>
+    <button type="button" id="wct-testrecorder-button" title="Open Test Recorder" style="border:1px solid rgba(255,255,255,.7);border-radius:4px;background:#20252b;color:#fff;padding:3px 8px;font:700 11px/1.2 system-ui,-apple-system,sans-serif;cursor:pointer;">Test Recorder</button>
+  </span>
+</div>
+<style id="wct-unshipped-banner-style">body { padding-top: 38px !important; } @keyframes wct-devconsole-error-flash { 0%,100% { background:#20252b; box-shadow:none; } 25%,75% { background:#ffd43b; color:#1a1a1a; box-shadow:0 0 0 4px rgba(255,212,59,.45); } } #wct-devconsole-button.wct-devconsole-error-flash { animation:wct-devconsole-error-flash .6s ease-in-out 5; }</style>
+<!-- WCT-UNSHIPPED-BANNER:END -->
+    <div id="wct-unshipped-banner" style="display:none;"></div>
+    <div class="container">
+        <h1>tbl_SS_Actions</h1>
+        <div id="sync-status">Initializing...</div>
+
+        <div class="nav-tabs">
+            <button type="button" class="nav-tab active" id="nav-dashboard" data-view="dashboard">Dashboard</button>
+            <button type="button" class="nav-tab" id="nav-metrics" data-view="metrics">Metrics</button>
+        </div>
+
+        <!-- DASHBOARD VIEW -->
+        <div id="view-dashboard" class="view active">
+            <button type="button" id="add-new-btn" class="btn-add">Add New Item</button>
+
+            <div class="filter-bar">
+                <div class="filter-group search-group">
+                    <label for="filter-search">Search</label>
+                    <input type="text" id="filter-search" placeholder="Tracking ref, title, POC, shop, description...">
+                </div>
+                <div class="filter-group">
+                    <label for="filter-status">Status</label>
+                    <select id="filter-status"><option value="">All Statuses</option></select>
+                </div>
+                <div class="filter-group">
+                    <label for="filter-priority">Priority</label>
+                    <select id="filter-priority"><option value="">All Priorities</option></select>
+                </div>
+                <div class="filter-group">
+                    <label for="filter-phase">Phase</label>
+                    <select id="filter-phase"><option value="">All Phases</option></select>
+                </div>
+                <div class="filter-group">
+                    <label for="filter-itemCategory">Category</label>
+                    <select id="filter-itemCategory"><option value="">All Categories</option></select>
+                </div>
+                <div class="filter-group">
+                    <label for="filter-procType">Proc Type</label>
+                    <select id="filter-procType"><option value="">All Proc Types</option></select>
+                </div>
+                <div class="filter-group">
+                    <label for="filter-assignEng">Assigned Engineer</label>
+                    <select id="filter-assignEng"><option value="">All Engineers</option></select>
+                </div>
+                <div class="filter-actions">
+                    <span class="ticket-count" id="ticket-count">0 of 0 tickets</span>
+                    <button type="button" id="clear-filters-btn" class="btn-clear">Clear Filters</button>
+                </div>
+            </div>
+
+            <div class="table-container">
+                <table id="tbl_SS_Actions">
+                    <thead>
+                        <tr></tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- METRICS VIEW -->
+        <div id="view-metrics" class="view">
+            <div class="metrics-placeholder">
+                <div class="icon">📊</div>
+                <h2>Metrics</h2>
+                <p>Coming soon.</p>
+            </div>
+        </div>
+
+        <!-- EDIT / ADD VIEW (full page, not a modal) -->
+        <div id="view-edit" class="view">
+            <button type="button" id="back-to-dashboard-btn" class="btn-back">&larr; Back to Dashboard</button>
+            <div class="edit-page-header">
+                <h2 id="form-title">Add Item</h2>
+            </div>
+            <div id="item-form-container">
+                <div id="item-form" class="form-grid"></div>
+                <div id="conflict-display" class="conflict-section" style="display:none;">
+                    <h4>Resolve Conflicts</h4>
+                    <p>This item has conflicting changes. Please review your version below and the server version before saving.</p>
+                    <div id="conflict-details"></div>
+                </div>
+            </div>
+            <div class="form-actions">
+                <div class="form-actions-left">
+                    <button type="button" id="remove-from-edit-btn" class="btn-remove" style="display:none;">Remove Item</button>
+                </div>
+                <div class="form-actions-right">
+                    <button type="button" id="cancel-btn" class="btn-cancel">Cancel</button>
+                    <button type="button" id="save-btn" class="btn-save">Save</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script>
+        document.addEventListener('DOMContentLoaded', async () => {
+            const tableHeaders = [
+                'ID', 'TrackingRef', 'Status', 'Priority', 'OrigShop', 'Approved', 'Closed', 'Phase', 'System', 'TIpart',
+                'TImodel', 'TInomen', 'TIcage', 'TIserial', 'ProbDesc', 'POCname', 'POCphone', 'POCemail', 'Createdby',
+                'AssignEng', 'EngNotes', 'Resolution', 'RefTEI', 'RefICP', 'RefICPRev', 'TInotes', 'BenefitShop',
+                'Reqname', 'Reqemail', 'Reqphone', 'DelayReason', 'ShopNameTag', 'ProcType', 'ICPno', 'ICPrevdate',
+                'Cklist', 'LCPno', 'TEInst', 'TitleTicket', 'Interval', 'IntJust', 'WorkNotes', 'MUAperf', 'EngStatus',
+                'QAperf', 'DelayDate', 'InWorkDate', 'delayDays', 'inWorkdays', 'LCPfuture', 'LCPinfolder', 'Cklistrefer',
+                'ModelCatJustInt', 'PersDelayDays', 'FundDelayDays', 'BTDelayDays', 'ReqDelayDays', 'OthDelayDays',
+                'LCPDelayDays', 'LCPinit', 'LCPcomp', 'LCPrej', 'StatusTicket', 'StUpdate', 'ECD', 'SERD', 'Acode', 'Rcode',
+                'CPARstatus', 'CPARsubmit', 'LCPDate', 'noCPARreason', 'LCPSubmit', 'Attachments', 'cramuaTL', 'draftlcpvtTL',
+                'btTL', 'revisedlcpTL', 'cparsubTL', 'localpassTL', 'cparmgrpassTL', 'chengpassTL', 'muaTool', 'externalLCPNotes',
+                'CPARNotes', 'TEINotes', 'craChecklist', 'muaChecklist', 'lcgChecklist', "NMI'd", 'prevSub', 'NMIdBy',
+                'awaitingStatus', 'nextTask', 'miscChecklist', 'CompletedBy', 'itemCategory', 'CompString'
+            ];
+            const formFields = tableHeaders;
+            const personFields = ['POCname', 'Createdby', 'AssignEng', 'Reqname', 'CompletedBy', 'NMIdBy'];
+            const longTextFields = [
+                'ProbDesc', 'EngNotes', 'Resolution', 'TInotes', 'WorkNotes', 'StatusTicket', 'externalLCPNotes',
+                'CPARNotes', 'TEINotes', 'DelayReason', 'IntJust', 'ModelCatJustInt', 'noCPARreason'
+            ];
+
+            // Columns shown on the dashboard (summary view). Full detail is edited on its own page.
+            const dashboardColumns = [
+                'TrackingRef', 'Status', 'Priority', 'Phase', 'itemCategory', 'ProcType',
+                'TitleTicket', 'AssignEng', 'POCname', 'ShopNameTag', 'Approved', 'Closed', 'ECD'
+            ];
+
+            // Fields with a fixed, filterable dropdown on the dashboard.
+            const filterFieldMap = {
+                status: 'Status',
+                priority: 'Priority',
+                phase: 'Phase',
+                itemCategory: 'itemCategory',
+                procType: 'ProcType',
+                assignEng: 'AssignEng'
+            };
+            const searchFields = ['TrackingRef', 'TitleTicket', 'ProbDesc', 'POCname', 'AssignEng', 'ShopNameTag', 'TInomen', 'TImodel', 'Resolution'];
+
+            const tableHead = document.querySelector('#tbl_SS_Actions thead tr');
+            const tableBody = document.querySelector('#tbl_SS_Actions tbody');
+            const formGrid = document.querySelector('#item-form');
+            const addNewBtn = document.getElementById('add-new-btn');
+            const formTitle = document.getElementById('form-title');
+            const backToDashboardBtn = document.getElementById('back-to-dashboard-btn');
+            const cancelBtn = document.getElementById('cancel-btn');
+            const saveBtn = document.getElementById('save-btn');
+            const removeFromEditBtn = document.getElementById('remove-from-edit-btn');
+            const syncStatusEl = document.getElementById('sync-status');
+            const conflictDisplay = document.getElementById('conflict-display');
+            const conflictDetails = document.getElementById('conflict-details');
+            const ticketCountEl = document.getElementById('ticket-count');
+            const clearFiltersBtn = document.getElementById('clear-filters-btn');
+            const searchInput = document.getElementById('filter-search');
+
+            const navTabs = document.querySelectorAll('.nav-tab');
+            const views = {
+                dashboard: document.getElementById('view-dashboard'),
+                metrics: document.getElementById('view-metrics'),
+                edit: document.getElementById('view-edit')
+            };
+
+            let allItems = new Map();
+            let editingItemId = null;
+            let syncClient;
+            let peopleClient;
+            let filters = { search: '', status: '', priority: '', phase: '', itemCategory: '', procType: '', assignEng: '' };
+
+            function switchView(viewName) {
+                Object.keys(views).forEach(key => views[key].classList.toggle('active', key === viewName));
+                navTabs.forEach(tab => tab.classList.toggle('active', tab.dataset.view === viewName));
+                if (viewName === 'dashboard') {
+                    editingItemId = null;
+                }
+            }
+
+            function cssSlug(value) {
+                return String(value || '').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+            }
+
+            function getFieldText(item, field) {
+                const value = item[field];
+                if (personFields.includes(field) && value && typeof value === 'object') {
+                    return value.displayName || '';
+                }
+                return value == null ? '' : String(value);
+            }
+
+            function onRecordsChanged({ source, upserts, deletes }) {
+                deletes.forEach(deletedId => allItems.delete(deletedId));
+                upserts.forEach(record => allItems.set(record.ID, record));
+                populateFilterOptions();
+                renderDashboard();
+            }
+            function onStatusChange({ state, message }) {
+                syncStatusEl.textContent = `Sync Status: ${message}`;
+                syncStatusEl.style.backgroundColor = state === 'error' ? '#dc3545' : (state === 'ready' ? '#28a745' : '#6c757d');
+            }
+
+            function populateFilterOptions() {
+                const itemsArray = Array.from(allItems.values());
+                Object.keys(filterFieldMap).forEach(filterKey => {
+                    const field = filterFieldMap[filterKey];
+                    const select = document.getElementById(`filter-${filterKey}`);
+                    const currentValue = select.value;
+                    const distinctValues = new Set();
+                    itemsArray.forEach(item => {
+                        const text = getFieldText(item, field).trim();
+                        if (text) distinctValues.add(text);
+                    });
+                    const sorted = Array.from(distinctValues).sort((a, b) => a.localeCompare(b));
+                    const placeholderOption = select.options[0];
+                    select.innerHTML = '';
+                    select.appendChild(placeholderOption);
+                    sorted.forEach(value => {
+                        const option = document.createElement('option');
+                        option.value = value;
+                        option.textContent = value;
+                        select.appendChild(option);
+                    });
+                    if (sorted.includes(currentValue)) select.value = currentValue;
+                });
+            }
+
+            function matchesFilters(item) {
+                for (const filterKey of Object.keys(filterFieldMap)) {
+                    const activeValue = filters[filterKey];
+                    if (activeValue && getFieldText(item, filterFieldMap[filterKey]) !== activeValue) return false;
+                }
+                if (filters.search) {
+                    const haystack = searchFields.map(field => getFieldText(item, field)).join(' ').toLowerCase();
+                    if (!haystack.includes(filters.search)) return false;
+                }
+                return true;
+            }
+
+            function renderDashboard() {
+                const fullList = Array.from(allItems.values());
+                const filtered = fullList.filter(matchesFilters);
+                ticketCountEl.textContent = `${filtered.length} of ${fullList.length} tickets`;
+
+                tableBody.innerHTML = '';
+                if (filtered.length === 0) {
+                    tableBody.innerHTML = `<tr><td colspan="${dashboardColumns.length + 1}" style="text-align:center;">No tickets match the current filters.</td></tr>`;
+                    return;
+                }
+                filtered.sort((a, b) => (a.TrackingRef || '').localeCompare(b.TrackingRef || ''));
+                filtered.forEach(item => {
+                    const row = document.createElement('tr');
+                    row.dataset.id = item.ID;
+                    if (item._forgeConflicts) {
+                        row.classList.add('has-conflict');
+                    }
+
+                    let rowHTML = '';
+                    dashboardColumns.forEach(field => {
+                        const displayValue = getFieldText(item, field);
+                        if (field === 'Status') {
+                            rowHTML += `<td><span class="status-pill status-${cssSlug(displayValue)}">${displayValue || '—'}</span></td>`;
+                        } else if (field === 'Priority') {
+                            rowHTML += `<td><span class="priority-pill priority-${cssSlug(displayValue)}">${displayValue || '—'}</span></td>`;
+                        } else {
+                            rowHTML += `<td title="${displayValue}">${displayValue}</td>`;
+                        }
+                    });
+                    rowHTML += `
+                        <td class="actions">
+                            <button type="button" class="btn-edit" data-id="${item.ID}">Edit</button>
+                            <button type="button" class="btn-remove" data-id="${item.ID}">Remove</button>
+                        </td>`;
+                    row.innerHTML = rowHTML;
+                    tableBody.appendChild(row);
+                });
+            }
+
+            function openEditPage(title, item = null) {
+                formTitle.textContent = title;
+                conflictDisplay.style.display = 'none';
+                formFields.forEach(field => {
+                    const input = document.getElementById(`field-${field}`);
+                    input.value = '';
+                    if (item) {
+                       const value = item[field];
+                       if (personFields.includes(field) && value && typeof value === 'object') {
+                           input.value = value.displayName || '';
+                           input.dataset.person = JSON.stringify(value);
+                       } else {
+                           input.value = value || '';
+                       }
+                    } else {
+                        delete input.dataset.person;
+                    }
+                });
+                if (item) {
+                    editingItemId = item.ID;
+                    document.getElementById('field-ID').readOnly = true;
+                    removeFromEditBtn.style.display = '';
+                    if (item._forgeConflicts) {
+                        conflictDisplay.style.display = 'block';
+                        conflictDetails.innerHTML = `<pre>${JSON.stringify(item._forgeConflicts, null, 2)}</pre>`;
+                    }
+                } else {
+                    editingItemId = null;
+                    const newId = crypto.randomUUID();
+                    document.getElementById('field-ID').value = newId;
+                    document.getElementById('field-ID').readOnly = true;
+                    removeFromEditBtn.style.display = 'none';
+                }
+                switchView('edit');
+                document.getElementById('item-form-container').scrollTop = 0;
+            }
+
+            async function handleSave() {
+                const id = document.getElementById('field-ID').value;
+                let record = allItems.get(id) || { ID: id };
+                formFields.forEach(field => {
+                    const input = document.getElementById(`field-${field}`);
+                    if (personFields.includes(field) && input.dataset.person) {
+                        record[field] = JSON.parse(input.dataset.person);
+                    } else {
+                        record[field] = input.value;
+                    }
+                });
+
+                // Clear conflicts on save
+                delete record._forgeConflicts;
+
+                try {
+                    await syncClient.save(record);
+                } catch(e) {
+                    console.error("Save failed:", e);
+                    alert("Failed to save record. See console for details.");
+                    return;
+                }
+                switchView('dashboard');
+            }
+            function handleEdit(id) {
+                const item = allItems.get(id);
+                if (item) {
+                    openEditPage('Edit Item', item);
+                }
+            }
+            async function handleRemove(id) {
+                if (confirm('Are you sure you want to remove this item?')) {
+                     try {
+                        await syncClient.remove(id);
+                    } catch(e) {
+                        console.error("Remove failed:", e);
+                        alert("Failed to remove record. See console for details.");
+                    }
+                }
+            }
+            async function handleRemoveFromEdit() {
+                if (!editingItemId) return;
+                if (confirm('Are you sure you want to remove this item?')) {
+                    try {
+                        await syncClient.remove(editingItemId);
+                        switchView('dashboard');
+                    } catch(e) {
+                        console.error("Remove failed:", e);
+                        alert("Failed to remove record. See console for details.");
+                    }
+                }
+            }
+
+            async function init() {
+                formGrid.innerHTML = formFields.map(field => {
+                    const isLongText = longTextFields.includes(field);
+                    const control = isLongText
+                        ? `<textarea id="field-${field}" name="${field}" rows="4"></textarea>`
+                        : `<input type="text" id="field-${field}" name="${field}">`;
+                    return `
+                        <div class="form-group${isLongText ? ' full-width' : ''}">
+                            <label for="field-${field}">${field}</label>
+                            ${control}
+                        </div>
+                    `;
+                }).join('');
+                tableHead.innerHTML = dashboardColumns.map(h => `<th>${h}</th>`).join('') + '<th>Actions</th>';
+
+                navTabs.forEach(tab => {
+                    tab.addEventListener('click', () => switchView(tab.dataset.view));
+                });
+
+                addNewBtn.addEventListener('click', () => openEditPage('Add New Item'));
+                saveBtn.addEventListener('click', handleSave);
+                cancelBtn.addEventListener('click', () => switchView('dashboard'));
+                backToDashboardBtn.addEventListener('click', () => switchView('dashboard'));
+                removeFromEditBtn.addEventListener('click', handleRemoveFromEdit);
+
+                tableBody.addEventListener('click', (event) => {
+                    const target = event.target;
+                    if (target.classList.contains('btn-edit')) {
+                        handleEdit(target.dataset.id);
+                    } else if (target.classList.contains('btn-remove')) {
+                        handleRemove(target.dataset.id);
+                    }
+                });
+
+                searchInput.addEventListener('input', (event) => {
+                    filters.search = event.target.value.trim().toLowerCase();
+                    renderDashboard();
+                });
+                Object.keys(filterFieldMap).forEach(filterKey => {
+                    document.getElementById(`filter-${filterKey}`).addEventListener('change', (event) => {
+                        filters[filterKey] = event.target.value;
+                        renderDashboard();
+                    });
+                });
+                clearFiltersBtn.addEventListener('click', () => {
+                    filters = { search: '', status: '', priority: '', phase: '', itemCategory: '', procType: '', assignEng: '' };
+                    searchInput.value = '';
+                    Object.keys(filterFieldMap).forEach(filterKey => {
+                        document.getElementById(`filter-${filterKey}`).value = '';
+                    });
+                    renderDashboard();
+                });
+
+                try {
+                    peopleClient = await ForgeSharePointSync.createPeopleClient();
+                    personFields.forEach(field => {
+                        const input = document.getElementById(`field-${field}`);
+                        if(input) {
+                            peopleClient.attachAutocomplete(input, {
+                                onSelect: (person) => {
+                                    input.dataset.person = JSON.stringify(person);
+                                }
+                            });
+                        }
+                    });
+                } catch(e) {
+                    console.error("Could not initialize People Client:", e);
+                    onStatusChange({state: 'error', message: 'People Client Failed'});
+                }
+                try {
+                    syncClient = await ForgeSharePointSync.create({
+                        listTitle: 'tbl_SS_Actions_Data_a1b2c3d4e5',
+                        itemType: 'tbl_SS_Actions_Item',
+                        getRecordId: (record) => record.ID,
+                        onRecordsChanged,
+                        onStatusChange,
+                    });
+                    await syncClient.start();
+                } catch(e) {
+                    console.error("Could not initialize SharePoint Sync:", e);
+                    onStatusChange({state: 'error', message: 'Sync Failed To Start'});
+                }
+
+                populateFilterOptions();
+                renderDashboard();
+            }
+            init();
+        });
+    </script>
+    <script src="testRecorder.js"></script>
+</body>
+</html>
