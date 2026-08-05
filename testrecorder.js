@@ -5,6 +5,7 @@
 
   const STORAGE_KEY = 'test-recorder:lastScenario';
   const UI_CLASS = 'test-recorder-ui';
+  const RECORDED_TESTS_FOLDER = 'Recorded Tests';
   const state = {
     recording: false,
     playing: false,
@@ -15,7 +16,12 @@
     jsonArea: null,
     status: null,
     speedMode: false,
-    speedMs: 50
+    speedMs: 50,
+    playbackPaused: false,
+    playbackResumeResolvers: [],
+    testName: 'Recorded flow',
+    testNameInput: null,
+    savedTestSelect: null
   };
 
   const safeCss = (value) => {
@@ -57,7 +63,7 @@
 
   const persist = () => {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ name: 'Recorded flow', steps: state.steps }));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ name: state.testName, steps: state.steps }));
     } catch (e) { }
   };
 
@@ -66,7 +72,10 @@
       const raw = localStorage.getItem(STORAGE_KEY);
       if (!raw) return;
       const parsed = JSON.parse(raw);
-      if (parsed && Array.isArray(parsed.steps)) state.steps = parsed.steps;
+      if (parsed && Array.isArray(parsed.steps)) {
+        state.steps = parsed.steps;
+        if (typeof parsed.name === 'string' && parsed.name.trim()) state.testName = parsed.name.trim();
+      }
     } catch (e) { }
   };
 
@@ -91,7 +100,7 @@
 
   const updateJsonArea = () => {
     if (!state.jsonArea) return;
-    const payload = { name: 'Recorded flow', steps: state.steps };
+    const payload = { name: state.testName, steps: state.steps };
     state.jsonArea.value = JSON.stringify(payload, null, 2);
   };
 
@@ -166,6 +175,45 @@
 
   const wait = (ms) => new Promise(res => setTimeout(res, ms));
 
+  const waitWhileReplayPaused = async () => {
+    while (state.playbackPaused) {
+      await new Promise(resolve => state.playbackResumeResolvers.push(resolve));
+    }
+  };
+
+  const waitDuringReplay = async (ms) => {
+    let remaining = Math.max(0, Number(ms) || 0);
+    while (remaining > 0) {
+      await waitWhileReplayPaused();
+      const slice = Math.min(50, remaining);
+      await wait(slice);
+      if (!state.playbackPaused) remaining -= slice;
+    }
+  };
+
+  const setReplayControls = () => {
+    if (!state.panel) return;
+    const playButton = state.panel.querySelector('[data-action="play"]');
+    const pauseButton = state.panel.querySelector('[data-action="pause-replay"]');
+    if (playButton) playButton.disabled = state.playing;
+    if (pauseButton) {
+      pauseButton.hidden = !state.playing;
+      pauseButton.textContent = state.playbackPaused ? '▶ Resume Replay' : '⏸ Pause Replay';
+    }
+  };
+
+  const toggleReplayPause = () => {
+    if (!state.playing) return;
+    state.playbackPaused = !state.playbackPaused;
+    if (!state.playbackPaused) {
+      state.playbackResumeResolvers.splice(0).forEach(resolve => resolve());
+      setStatus('Replaying...');
+    } else {
+      setStatus('Replay paused');
+    }
+    setReplayControls();
+  };
+
   const showBlockingOverlay = (message, resolve) => {
     let overlay = document.getElementById('test-recorder-blocking');
     if (overlay) overlay.remove();
@@ -207,12 +255,16 @@
   const playSteps = async () => {
     if (state.playing || state.steps.length === 0) return;
     state.playing = true;
+    state.playbackPaused = false;
+    setReplayControls();
     setStatus('Replaying...');
     try {
       for (const step of state.steps) {
+        await waitWhileReplayPaused();
         const overrideDelay = state.speedMode ? Math.max(1, Number(state.speedMs) || 1) : null;
         const effectiveDelay = overrideDelay !== null ? overrideDelay : step.delayMs;
-        if (effectiveDelay) await wait(effectiveDelay);
+        if (effectiveDelay) await waitDuringReplay(effectiveDelay);
+        await waitWhileReplayPaused();
         if (step.type === 'pause') {
           await new Promise(res => showBlockingOverlay(step.message, res));
           continue;
@@ -258,36 +310,192 @@
           default:
             break;
         }
-        await wait(80);
+        await waitDuringReplay(80);
       }
     } finally {
       state.playing = false;
+      state.playbackPaused = false;
+      state.playbackResumeResolvers.splice(0).forEach(resolve => resolve());
+      setReplayControls();
       setStatus('Steps: ' + state.steps.length);
     }
   };
 
-  const downloadJson = () => {
-    const payload = { name: 'Recorded flow', steps: state.steps };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'test-recorder.json';
-    a.click();
-    URL.revokeObjectURL(url);
+  const getForgeProjectDirectory = () => {
+    const candidates = [window.top, window.parent, window.opener];
+    for (const candidate of candidates) {
+      if (!candidate || candidate === window) continue;
+      try {
+        const handle = candidate.loadFolder && candidate.loadFolder.fileHandle;
+        if (handle && typeof handle.getDirectoryHandle === 'function') return handle;
+      } catch (_) {
+        // Cross-origin parents and openers are expected when the app runs outside Forge.
+      }
+    }
+    return null;
+  };
+
+  const sanitizeTestName = (value) => {
+    const clean = String(value || '')
+      .replace(/[<>:"/\|?* -]/g, ' ')
+      .replace(/s+/g, ' ')
+      .replace(/[. ]+$/g, '')
+      .trim()
+      .slice(0, 100);
+    if (!clean) throw new Error('Enter a test name.');
+    return clean;
+  };
+
+  const requestForgeStorage = (action, payload) => new Promise((resolve, reject) => {
+    const id = 'tr-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+    let channel = null;
+    let finished = false;
+    const cleanup = () => {
+      window.removeEventListener('message', onMessage);
+      if (channel) channel.close();
+      clearTimeout(timeoutId);
+    };
+    const finish = message => {
+      if (finished || !message || message.__forgeTestRecorderStorage !== true ||
+          message.direction !== 'response' || message.id !== id) return;
+      finished = true;
+      cleanup();
+      if (message.ok) resolve(message.result);
+      else reject(new Error(message.error || 'Forge could not access the saved tests.'));
+    };
+    const onMessage = event => finish(event && event.data);
+    window.addEventListener('message', onMessage);
+    const timeoutId = setTimeout(() => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      reject(new Error('Forge could not be reached. Keep Forge open and run the app from its preview.'));
+    }, 4000);
+    const request = {
+      __forgeTestRecorderStorage: true,
+      direction: 'request',
+      id,
+      action,
+      payload: payload || {}
+    };
+    const target = window.top && window.top !== window
+      ? window.top
+      : window.opener && window.opener !== window
+        ? window.opener
+        : null;
+    if (target && typeof target.postMessage === 'function') {
+      target.postMessage(request, '*');
+      return;
+    }
+    if (typeof BroadcastChannel === 'function') {
+      channel = new BroadcastChannel('forge-test-recorder-storage');
+      channel.onmessage = event => finish(event && event.data);
+      channel.postMessage(request);
+      return;
+    }
+    finished = true;
+    cleanup();
+    reject(new Error('Forge could not be reached. Keep Forge open and run the app from its preview.'));
+  });
+
+  const getRecordedTestsDirectory = async (create) => {
+    const projectDirectory = getForgeProjectDirectory();
+    if (!projectDirectory) return null;
+    return await projectDirectory.getDirectoryHandle(RECORDED_TESTS_FOLDER, { create: !!create });
+  };
+
+  const listSavedTests = async () => {
+    const directory = await getRecordedTestsDirectory(false).catch(error => {
+      if (error && error.name === 'NotFoundError') return null;
+      throw error;
+    });
+    if (!directory) return await requestForgeStorage('list');
+    const tests = [];
+    for await (const entry of directory.values()) {
+      if (!entry || entry.kind !== 'file' || !/.json$/i.test(entry.name)) continue;
+      let name = entry.name.replace(/.json$/i, '');
+      try {
+        const parsed = JSON.parse(await (await entry.getFile()).text());
+        if (parsed && typeof parsed.name === 'string' && parsed.name.trim()) name = parsed.name.trim();
+      } catch (_) { }
+      tests.push({ name, fileName: entry.name });
+    }
+    return tests.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+  };
+
+  const saveJson = async () => {
+    const name = sanitizeTestName(state.testNameInput && state.testNameInput.value);
+    state.testName = name;
+    const payload = { name, steps: state.steps };
+    const testsDirectory = await getRecordedTestsDirectory(true);
+    if (!testsDirectory) return await requestForgeStorage('save', payload);
+    const fileName = name + '.json';
+    const fileHandle = await testsDirectory.getFileHandle(fileName, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(JSON.stringify(payload, null, 2));
+    await writable.close();
+    return { name, fileName };
+  };
+
+  const loadSavedTest = async (fileName) => {
+    const testsDirectory = await getRecordedTestsDirectory(false);
+    if (!testsDirectory) return await requestForgeStorage('load', { fileName });
+    const fileHandle = await testsDirectory.getFileHandle(fileName, { create: false });
+    const parsed = JSON.parse(await (await fileHandle.getFile()).text());
+    if (!parsed || !Array.isArray(parsed.steps)) throw new Error('The saved test is not valid.');
+    return { name: parsed.name || fileName.replace(/.json$/i, ''), steps: parsed.steps, fileName };
   };
 
   const loadJson = (raw) => {
     try {
-      const parsed = JSON.parse(raw);
+      const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
       if (!parsed || !Array.isArray(parsed.steps)) throw new Error('Invalid JSON format');
       state.steps = parsed.steps;
+      if (parsed.name) state.testName = String(parsed.name);
+      if (state.testNameInput) state.testNameInput.value = state.testName;
       resetTiming();
       persist();
       updateJsonArea();
       setStatus('Steps: ' + state.steps.length);
     } catch (e) {
       alert('Failed to parse JSON: ' + e.message);
+    }
+  };
+
+  const refreshSavedTests = async (preferredFileName) => {
+    if (!state.savedTestSelect) return [];
+    const select = state.savedTestSelect;
+    const previous = preferredFileName || select.value;
+    select.disabled = true;
+    select.replaceChildren();
+    const loadingOption = document.createElement('option');
+    loadingOption.value = '';
+    loadingOption.textContent = 'Loading saved tests...';
+    select.appendChild(loadingOption);
+    try {
+      const tests = await listSavedTests();
+      select.replaceChildren();
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = tests.length ? 'Choose a saved test' : 'No saved tests yet';
+      select.appendChild(placeholder);
+      tests.forEach(test => {
+        const option = document.createElement('option');
+        option.value = test.fileName;
+        option.textContent = test.name;
+        select.appendChild(option);
+      });
+      select.disabled = tests.length === 0;
+      if (previous && tests.some(test => test.fileName === previous)) select.value = previous;
+      return tests;
+    } catch (error) {
+      select.replaceChildren();
+      const unavailable = document.createElement('option');
+      unavailable.value = '';
+      unavailable.textContent = 'Forge storage unavailable';
+      select.appendChild(unavailable);
+      select.disabled = true;
+      throw error;
     }
   };
 
@@ -338,11 +546,16 @@
       '<button class="tr-close">×</button>' +
       '</div>' +
       '<div class="tr-body">' +
+      '<label class="tr-field">' +
+      '<span>Test name</span>' +
+      '<input type="text" data-action="test-name" maxlength="100" />' +
+      '</label>' +
       '<div class="tr-row">' +
+      '<button class="tr-btn replay" data-action="play">▶ Replay Test</button>' +
+      '<button class="tr-btn replay-pause" data-action="pause-replay" hidden>⏸ Pause Replay</button>' +
       '<button class="tr-btn" data-action="record">Start Recording</button>' +
       '<button class="tr-btn" data-action="stop" disabled>Stop</button>' +
-      '<button class="tr-btn secondary" data-action="play">Replay</button>' +
-      '<button class="tr-btn secondary" data-action="pause">Add Pause</button>' +
+      '<button class="tr-btn secondary" data-action="pause">Add Manual Pause Step</button>' +
       '<button class="tr-btn danger" data-action="clear">Clear</button>' +
       '</div>' +
       '<div class="tr-row">' +
@@ -355,11 +568,18 @@
       '</label>' +
       '</div>' +
       '<textarea class="tr-json" rows="10" spellcheck="false"></textarea>' +
+      '<div class="tr-row tr-saved-row">' +
+      '<select data-action="saved-test" aria-label="Saved test">' +
+      '<option value="">Loading saved tests...</option>' +
+      '</select>' +
+      '<button class="tr-btn secondary" data-action="load-saved">Load Saved Test</button>' +
+      '<button class="tr-btn secondary" data-action="refresh-saved" title="Refresh saved tests">↻</button>' +
+      '</div>' +
       '<div class="tr-row">' +
       '<button class="tr-btn secondary" data-action="copy">Copy JSON</button>' +
-      '<button class="tr-btn secondary" data-action="download">Download JSON</button>' +
+      '<button class="tr-btn save" data-action="save">Save Named Test</button>' +
       '<label class="tr-btn secondary tr-file">' +
-      'Load JSON' +
+      'Import JSON' +
       '<input type="file" accept=".json,application/json" />' +
       '</label>' +
       '</div>' +
@@ -371,15 +591,27 @@
     const bannerBtn = document.getElementById('wct-testrecorder-button');
     if (bannerBtn) {
       launcher.style.display = 'none';
-      bannerBtn.addEventListener('click', () => panel.classList.add('show'));
+      bannerBtn.addEventListener('click', () => {
+        panel.classList.add('show');
+        refreshSavedTests().catch(() => {});
+      });
     }
 
     state.panel = panel;
     state.jsonArea = panel.querySelector('.tr-json');
     state.status = panel.querySelector('.tr-status');
+    state.testNameInput = panel.querySelector('[data-action="test-name"]');
+    state.savedTestSelect = panel.querySelector('[data-action="saved-test"]');
+    state.testNameInput.value = state.testName;
+    state.testNameInput.addEventListener('input', () => {
+      state.testName = state.testNameInput.value;
+      persist();
+      updateJsonArea();
+    });
 
     launcher.addEventListener('click', () => {
       panel.classList.toggle('show');
+      if (panel.classList.contains('show')) refreshSavedTests().catch(() => {});
     });
     panel.querySelector('.tr-close').addEventListener('click', () => panel.classList.remove('show'));
 
@@ -397,12 +629,39 @@
       panel.querySelector('[data-action="stop"]').disabled = true;
     });
     panel.querySelector('[data-action="play"]').addEventListener('click', () => playSteps());
+    panel.querySelector('[data-action="pause-replay"]').addEventListener('click', () => toggleReplayPause());
     panel.querySelector('[data-action="pause"]').addEventListener('click', () => addPause());
     panel.querySelector('[data-action="clear"]').addEventListener('click', () => clearSteps());
     panel.querySelector('[data-action="copy"]').addEventListener('click', () => {
       navigator.clipboard.writeText(state.jsonArea.value || '');
     });
-    panel.querySelector('[data-action="download"]').addEventListener('click', () => downloadJson());
+    panel.querySelector('[data-action="save"]').addEventListener('click', async () => {
+      try {
+        const result = await saveJson();
+        setStatus('Saved: ' + RECORDED_TESTS_FOLDER + '/' + result.fileName);
+        await refreshSavedTests(result.fileName);
+      } catch (error) {
+        console.error('Test Recorder save failed:', error);
+        setStatus('Save failed');
+        alert('Could not save the recorded test: ' + (error && error.message ? error.message : error));
+      }
+    });
+    panel.querySelector('[data-action="load-saved"]').addEventListener('click', async () => {
+      const fileName = state.savedTestSelect && state.savedTestSelect.value;
+      if (!fileName) return;
+      try {
+        const saved = await loadSavedTest(fileName);
+        loadJson(saved);
+        setStatus('Loaded: ' + saved.name);
+      } catch (error) {
+        console.error('Test Recorder load failed:', error);
+        setStatus('Load failed');
+        alert('Could not load the saved test: ' + (error && error.message ? error.message : error));
+      }
+    });
+    panel.querySelector('[data-action="refresh-saved"]').addEventListener('click', () => {
+      refreshSavedTests().catch(error => setStatus(error && error.message ? error.message : 'Refresh failed'));
+    });
 
     const speedModeCb = panel.querySelector('[data-action="speed-mode"]');
     const speedMsInput = panel.querySelector('[data-action="speed-ms"]');
@@ -431,26 +690,34 @@
     });
 
     updateJsonArea();
+    setReplayControls();
     setStatus('Steps: ' + state.steps.length);
+    refreshSavedTests().catch(() => {});
   };
 
   const injectStyles = () => {
     const style = document.createElement('style');
     style.textContent =
       '#test-recorder-launcher{position:fixed;right:16px;bottom:16px;z-index:2147483647;background:#dc3545;color:#fff;border:none;border-radius:999px;padding:10px 14px;font-weight:700;box-shadow:0 4px 12px rgba(0,0,0,.3);}' +
-      '#test-recorder-panel{position:fixed;right:16px;bottom:64px;width:360px;max-width:90vw;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:10px;box-shadow:0 10px 24px rgba(0,0,0,.35);display:none;z-index:2147483647;}' +
+      '#test-recorder-panel{position:fixed;right:16px;bottom:64px;width:430px;max-width:90vw;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:10px;box-shadow:0 10px 24px rgba(0,0,0,.35);display:none;z-index:2147483647;}' +
       '#test-recorder-panel.show{display:block;}' +
       '#test-recorder-panel .tr-header{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid #334155;}' +
       '#test-recorder-panel .tr-header strong{flex:1;}' +
       '#test-recorder-panel .tr-close{background:transparent;border:none;color:#94a3b8;font-size:18px;}' +
       '#test-recorder-panel .tr-body{padding:10px 12px;}' +
+      '#test-recorder-panel .tr-field{display:grid;gap:4px;margin-bottom:10px;font-size:12px;font-weight:700;color:#cbd5e1;}' +
+      '#test-recorder-panel .tr-field input,#test-recorder-panel select{box-sizing:border-box;width:100%;background:#0b1220;color:#e2e8f0;border:1px solid #475569;border-radius:6px;padding:7px 8px;font:inherit;}' +
       '#test-recorder-panel .tr-row{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;}' +
       '#test-recorder-panel .tr-btn{background:#2563eb;border:none;color:#fff;padding:6px 10px;border-radius:6px;font-size:12px;cursor:pointer;}' +
       '#test-recorder-panel .tr-btn.secondary{background:#334155;color:#e2e8f0;}' +
+      '#test-recorder-panel .tr-btn.replay{background:#16a34a;font-size:14px;font-weight:800;padding:9px 16px;box-shadow:0 0 0 2px rgba(74,222,128,.25);}' +
+      '#test-recorder-panel .tr-btn.replay-pause{background:#d97706;font-size:13px;font-weight:800;padding:9px 13px;}' +
+      '#test-recorder-panel .tr-btn.save{background:#2563eb;font-weight:800;}' +
       '#test-recorder-panel .tr-btn.danger{background:#b91c1c;color:#fff;}' +
       '#test-recorder-panel .tr-btn[disabled]{opacity:0.5;cursor:not-allowed;}' +
       '#test-recorder-panel .tr-speed{display:flex;align-items:center;gap:6px;font-size:12px;color:#cbd5f5;}' +
       '#test-recorder-panel .tr-speed input[type="number"]{width:70px;background:#0b1220;color:#e2e8f0;border:1px solid #1e293b;border-radius:6px;padding:3px 6px;}' +
+      '#test-recorder-panel .tr-saved-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;}' +
       '#test-recorder-panel .tr-json{width:100%;background:#0b1220;color:#e2e8f0;border:1px solid #1e293b;border-radius:6px;padding:8px;font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;}' +
       '#test-recorder-panel .tr-file{position:relative;overflow:hidden;}' +
       '#test-recorder-panel .tr-file input{position:absolute;left:-9999px;}' +
@@ -464,6 +731,7 @@
   const togglePanel = () => {
     if (!state.panel) return;
     state.panel.classList.toggle('show');
+    if (state.panel.classList.contains('show')) refreshSavedTests().catch(() => {});
   };
 
   const bindShortcuts = () => {

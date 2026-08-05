@@ -1,0 +1,2415 @@
+<!--WFC-MANIFEST:eyJ2ZXJzaW9uIjoxLCJwcm9qZWN0IjoiTmV3U1NEYXNoYm9hcmQiLCJnZW5lcmF0ZWQiOiIyMDI2LTA4LTA1VDIyOjQxOjE0LjgxM1oiLCJpbmRleCI6ImluZGV4Lmh0bWwiLCJmaWxlcyI6W3sia2luZCI6ImpzIiwicGF0aCI6ImZvcmdlLXNoYXJlcG9pbnQtc3luYy5qcyIsImV4dGVybmFsIjpmYWxzZSwiaGFzaCI6IjRjYzY0NWY3In1dfQ==-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <script>
+(function (global) {
+  'use strict';
+
+  var VERSION = '1.1.0';
+  var REQUIRED_FIELDS = {
+    ItemType: '<Field Type="Text" DisplayName="ItemType" Name="ItemType" StaticName="ItemType" Required="FALSE" />',
+    DataJson: '<Field Type="Note" DisplayName="DataJson" Name="DataJson" StaticName="DataJson" Required="FALSE" RichText="FALSE" NumLines="20" />'
+  };
+
+  function ForgeSyncError(message, details) {
+    Error.call(this, message);
+    this.name = 'ForgeSyncError';
+    this.message = message;
+    this.status = details && details.status || 0;
+    this.responseText = details && details.responseText || '';
+    this.retryAfterMs = details && details.retryAfterMs || 0;
+    if (Error.captureStackTrace) Error.captureStackTrace(this, ForgeSyncError);
+  }
+  ForgeSyncError.prototype = Object.create(Error.prototype);
+  ForgeSyncError.prototype.constructor = ForgeSyncError;
+
+  function sleep(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  function clone(value) {
+    if (value === undefined) return undefined;
+    return JSON.parse(JSON.stringify(value));
+  }
+
+  function equal(a, b) {
+    if (a === b) return true;
+    try { return JSON.stringify(a) === JSON.stringify(b); } catch (_) { return false; }
+  }
+
+  function isObject(value) {
+    return !!value && typeof value === 'object' && !Array.isArray(value);
+  }
+
+  function uuid() {
+    try {
+      if (global.crypto && typeof global.crypto.randomUUID === 'function') return global.crypto.randomUUID();
+    } catch (_) {}
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+      var r = Math.random() * 16 | 0;
+      return (c === 'x' ? r : (r & 3 | 8)).toString(16);
+    });
+  }
+
+  function safeStorage() {
+    try {
+      var storage = global.localStorage;
+      var test = '__forge_sync_test__';
+      storage.setItem(test, '1');
+      storage.removeItem(test);
+      return storage;
+    } catch (_) {
+      var values = {};
+      return {
+        getItem: function (key) { return Object.prototype.hasOwnProperty.call(values, key) ? values[key] : null; },
+        setItem: function (key, value) { values[key] = String(value); },
+        removeItem: function (key) { delete values[key]; }
+      };
+    }
+  }
+
+  function odataEscape(value) {
+    return String(value == null ? '' : value).replace(/'/g, "''");
+  }
+
+  function responseRetryAfterMs(response) {
+    var raw = response && response.headers && response.headers.get('Retry-After');
+    if (!raw) return 0;
+    var seconds = Number(raw);
+    if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+    var date = Date.parse(raw);
+    return Number.isFinite(date) ? Math.max(0, date - Date.now()) : 0;
+  }
+
+  function unwrap(payload) {
+    return payload && Object.prototype.hasOwnProperty.call(payload, 'd') ? payload.d : payload;
+  }
+
+  function results(payload) {
+    var value = unwrap(payload);
+    if (Array.isArray(value)) return value;
+    if (value && Array.isArray(value.results)) return value.results;
+    if (payload && Array.isArray(payload.value)) return payload.value;
+    return [];
+  }
+
+  function itemEtag(item, response) {
+    return String(
+      item && item.__metadata && item.__metadata.etag ||
+      item && item['@odata.etag'] ||
+      response && response.headers && response.headers.get('ETag') ||
+      ''
+    );
+  }
+
+  function nextLink(payload) {
+    var value = unwrap(payload);
+    return value && value.__next || payload && (payload['@odata.nextLink'] || payload['odata.nextLink']) || '';
+  }
+
+  function findSharePointSiteUrl() {
+    var candidate = '';
+    try {
+      if (global._spPageContextInfo && global._spPageContextInfo.webAbsoluteUrl) {
+        candidate = global._spPageContextInfo.webAbsoluteUrl;
+      }
+    } catch (_) {}
+    if (!candidate) {
+      try {
+        if (global.parent && global.parent !== global && global.parent._spPageContextInfo) {
+          candidate = global.parent._spPageContextInfo.webAbsoluteUrl || '';
+        }
+      } catch (_) {}
+    }
+    if (!candidate && global.document && global.document.referrer) {
+      try {
+        var ref = new URL(global.document.referrer);
+        var match = ref.pathname.match(/^\/(sites|teams)\/[^/]+/i);
+        if (match) candidate = ref.origin + match[0];
+      } catch (_) {}
+    }
+    return candidate ? String(candidate).replace(/\/$/, '') : '';
+  }
+
+  async function waitForSharePointSiteUrl(timeoutMs) {
+    var deadline = Date.now() + (Number(timeoutMs) || 10000);
+    var siteUrl = findSharePointSiteUrl();
+    while (!siteUrl && Date.now() < deadline) {
+      await sleep(100);
+      siteUrl = findSharePointSiteUrl();
+    }
+    if (!siteUrl) throw new ForgeSyncError('SharePoint context was not available from Firepit. No site URL was guessed.');
+    return siteUrl;
+  }
+
+  function collapseSpaces(value) {
+    return String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
+  }
+
+  function normalizePersonText(value) {
+    var text = String(value == null ? '' : value).toLowerCase();
+    try { text = text.normalize('NFD').replace(/[\u0300-\u036f]/g, ''); } catch (_) {}
+    return collapseSpaces(text
+      .replace(/^i:0[#.][^|]*\|(?:membership\|)?/i, '')
+      .replace(/[_.,;:/\\|@+()\[\]{}'"-]+/g, ' ')
+      .replace(/[^a-z0-9\s]/g, ' '));
+  }
+
+  function personTokens(value) {
+    var normalized = normalizePersonText(value);
+    return normalized ? normalized.split(' ').filter(Boolean) : [];
+  }
+
+  function addUniqueText(target, seen, value) {
+    var clean = collapseSpaces(value);
+    var key = normalizePersonText(clean);
+    if (!clean || !key || seen.has(key)) return;
+    seen.add(key);
+    target.push(clean);
+  }
+
+  function buildPersonQueryVariants(query) {
+    var raw = collapseSpaces(query);
+    var variants = [];
+    var seen = new Set();
+    if (!raw) return variants;
+    addUniqueText(variants, seen, raw);
+
+    var commaParts = raw.split(',').map(collapseSpaces).filter(Boolean);
+    if (commaParts.length > 1) {
+      addUniqueText(variants, seen, commaParts.slice(1).join(' ') + ' ' + commaParts[0]);
+    }
+
+    var canonical = collapseSpaces(raw.replace(/[,;]+/g, ' '));
+    addUniqueText(variants, seen, canonical);
+    var tokens = canonical.split(' ').filter(Boolean);
+    if (tokens.length > 1) {
+      addUniqueText(variants, seen, tokens.slice().reverse().join(' '));
+      addUniqueText(variants, seen, tokens[0] + ' ' + tokens[tokens.length - 1]);
+      addUniqueText(variants, seen, tokens[tokens.length - 1] + ' ' + tokens[0]);
+    }
+    tokens.slice().sort(function (left, right) { return right.length - left.length; }).forEach(function (token) {
+      if (token.length >= 2) addUniqueText(variants, seen, token);
+    });
+    return variants;
+  }
+
+  function personNameVariants(displayName) {
+    var raw = collapseSpaces(displayName);
+    var variants = [];
+    var seen = new Set();
+    addUniqueText(variants, seen, raw);
+    var commaParts = raw.split(',').map(collapseSpaces).filter(Boolean);
+    if (commaParts.length > 1) {
+      var givenNames = commaParts.slice(1).join(' ');
+      addUniqueText(variants, seen, givenNames + ' ' + commaParts[0]);
+      var givenTokens = personTokens(givenNames);
+      if (givenTokens.length) addUniqueText(variants, seen, givenTokens[0] + ' ' + commaParts[0]);
+    }
+    var tokens = personTokens(raw);
+    if (tokens.length > 1) addUniqueText(variants, seen, tokens[0] + ' ' + tokens[tokens.length - 1]);
+    return variants.map(normalizePersonText).filter(Boolean);
+  }
+
+  function normalizePerson(entry) {
+    entry = entry || {};
+    var entityData = entry.EntityData || entry.entityData || {};
+    var description = String(entry.Description || entry.description || '').trim();
+    var rawId = String(
+      entry.sharePointId || entry.SharePointId || entry.Id || entry.id ||
+      entityData.SPUserID || entityData.SPUserId || entityData.UserId || ''
+    ).trim();
+    var email = String(entry.email || entry.Email || entityData.Email || (description.indexOf('@') >= 0 ? description : '') || '').trim();
+    var loginName = String(entry.loginName || entry.LoginName || entry.Key || entry.key || entityData.AccountName || '').trim();
+    return {
+      displayName: collapseSpaces(entry.displayName || entry.DisplayName || entry.DisplayText || entry.Title || entityData.DisplayName || ''),
+      email: email,
+      loginName: loginName,
+      sharePointId: Number(rawId) > 0 ? String(Number(rawId)) : '',
+      department: collapseSpaces(entry.department || entry.Department || entityData.Department || ''),
+      jobTitle: collapseSpaces(entry.jobTitle || entry.JobTitle || entityData.Title || ''),
+      mobilePhone: collapseSpaces(entry.mobilePhone || entry.MobilePhone || entityData.MobilePhone || ''),
+      entityType: String(entry.entityType || entry.EntityType || ''),
+      source: String(entry.source || entry.ProviderName || entityData.PrincipalSource || ''),
+      raw: entry.raw || entry
+    };
+  }
+
+  function personIdentityKey(person) {
+    person = normalizePerson(person);
+    return normalizePersonText(person.loginName || person.email || person.displayName);
+  }
+
+  function tokenMatches(queryToken, candidateToken) {
+    return candidateToken === queryToken || candidateToken.indexOf(queryToken) === 0;
+  }
+
+  function scorePersonMatch(person, query) {
+    var normalized = normalizePerson(person);
+    var queryNormalized = normalizePersonText(query);
+    var queryTokenList = personTokens(query);
+    if (!queryNormalized || !queryTokenList.length || !normalized.displayName) return 0;
+
+    var nameVariants = personNameVariants(normalized.displayName);
+    var identityValues = nameVariants.concat([
+      normalizePersonText(normalized.email),
+      normalizePersonText(normalized.loginName),
+      normalizePersonText(normalized.department),
+      normalizePersonText(normalized.jobTitle)
+    ]).filter(Boolean);
+    var candidateTokens = [];
+    identityValues.forEach(function (value) {
+      value.split(' ').filter(Boolean).forEach(function (token) {
+        if (candidateTokens.indexOf(token) === -1) candidateTokens.push(token);
+      });
+    });
+    var covered = queryTokenList.every(function (queryToken) {
+      return candidateTokens.some(function (candidateToken) { return tokenMatches(queryToken, candidateToken); });
+    });
+    if (!covered) return 0;
+
+    if (nameVariants.indexOf(queryNormalized) >= 0) return 1000;
+    if (nameVariants.some(function (name) { return name.indexOf(queryNormalized) === 0; })) return 920;
+    if (normalizePersonText(normalized.email) === queryNormalized || normalizePersonText(normalized.loginName) === queryNormalized) return 900;
+
+    var exactTokens = queryTokenList.filter(function (queryToken) {
+      return candidateTokens.indexOf(queryToken) >= 0;
+    }).length;
+    var ordered = identityValues.some(function (value) {
+      var position = -1;
+      return queryTokenList.every(function (queryToken) {
+        position = value.indexOf(queryToken, position + 1);
+        return position >= 0;
+      });
+    });
+    var score = 600 + exactTokens * 35 + (ordered ? 70 : 0);
+    if (normalized.sharePointId) score += 5;
+    return score;
+  }
+
+  function rankPeople(candidates, query, limit) {
+    var deduped = new Map();
+    (candidates || []).forEach(function (candidate) {
+      var person = normalizePerson(candidate);
+      var key = personIdentityKey(person);
+      if (!key || !person.displayName) return;
+      var score = scorePersonMatch(person, query);
+      if (!score) return;
+      var current = deduped.get(key);
+      if (!current || score > current.matchScore) {
+        person.matchScore = score;
+        deduped.set(key, person);
+      }
+    });
+    var ranked = Array.from(deduped.values()).sort(function (left, right) {
+      return right.matchScore - left.matchScore || left.displayName.localeCompare(right.displayName);
+    });
+    return Number(limit) > 0 ? ranked.slice(0, Number(limit)) : ranked;
+  }
+
+  function escapeMarkup(value) {
+    return String(value == null ? '' : value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function PeopleClient(options) {
+    options = options || {};
+    this.options = options;
+    this.siteUrl = options.siteUrl ? String(options.siteUrl).replace(/\/$/, '') : '';
+    this.config = {
+      contextTimeoutMs: Number(options.contextTimeoutMs) || 10000,
+      requestTimeoutMs: Number(options.requestTimeoutMs) || 15000,
+      minimumQueryLength: Math.max(1, Number(options.minimumQueryLength) || 2),
+      maximumSuggestions: Math.max(1, Number(options.maximumSuggestions) || 15),
+      maximumRemoteQueries: Math.max(1, Number(options.maximumRemoteQueries) || 4),
+      cacheTtlMs: options.cacheTtlMs == null ? 30000 : Math.max(0, Number(options.cacheTtlMs) || 0),
+      debounceMs: options.debounceMs == null ? 250 : Math.max(0, Number(options.debounceMs) || 0),
+      principalSource: Number.isFinite(Number(options.principalSource)) ? Number(options.principalSource) : 15,
+      principalType: Number.isFinite(Number(options.principalType)) ? Number(options.principalType) : 1,
+      sharePointGroupId: Number(options.sharePointGroupId || options.sharePointGroupID) || 0
+    };
+    this.digest = '';
+    this.digestExpiresAt = 0;
+    this.cache = new Map();
+    this.inflight = new Map();
+    this.ready = false;
+  }
+
+  PeopleClient.prototype.initialize = async function () {
+    if (!this.siteUrl) this.siteUrl = await waitForSharePointSiteUrl(this.config.contextTimeoutMs);
+    this.ready = true;
+    return this;
+  };
+
+  PeopleClient.prototype.request = async function (url, options) {
+    options = options || {};
+    var controller = typeof AbortController === 'function' ? new AbortController() : null;
+    var externalSignal = options.signal;
+    var abortFromExternal = function () { if (controller) controller.abort(); };
+    if (externalSignal && externalSignal.addEventListener) externalSignal.addEventListener('abort', abortFromExternal, { once: true });
+    var timer = setTimeout(function () { if (controller) controller.abort(); }, options.timeoutMs || this.config.requestTimeoutMs);
+    try {
+      var fetcher = global.fetch || (typeof fetch === 'function' && fetch);
+      if (!fetcher) throw new ForgeSyncError('This browser does not provide fetch().');
+      var response = await fetcher(url, {
+        method: options.method || 'GET',
+        credentials: 'include',
+        headers: Object.assign({ Accept: 'application/json;odata=verbose' }, options.headers || {}),
+        body: options.body,
+        signal: controller ? controller.signal : externalSignal
+      });
+      var text = await response.text();
+      var payload = null;
+      if (text) {
+        try { payload = JSON.parse(text); } catch (_) {}
+      }
+      if (!response.ok) {
+        var detail = payload && payload.error && payload.error.message && (payload.error.message.value || payload.error.message) || response.statusText || text;
+        throw new ForgeSyncError('SharePoint request failed (' + response.status + '): ' + detail, {
+          status: response.status,
+          responseText: text,
+          retryAfterMs: responseRetryAfterMs(response)
+        });
+      }
+      return { response: response, payload: payload, text: text };
+    } catch (error) {
+      if (error && error.name === 'AbortError') throw new ForgeSyncError('SharePoint people request was cancelled or timed out.');
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      if (externalSignal && externalSignal.removeEventListener) externalSignal.removeEventListener('abort', abortFromExternal);
+    }
+  };
+
+  PeopleClient.prototype.getDigest = async function () {
+    if (this.digest && Date.now() < this.digestExpiresAt) return this.digest;
+    if (!this.ready) await this.initialize();
+    var result = await this.request(this.siteUrl + '/_api/contextinfo', { method: 'POST' });
+    var info = unwrap(result.payload) && unwrap(result.payload).GetContextWebInformation;
+    if (!info || !info.FormDigestValue) throw new ForgeSyncError('SharePoint returned no request digest.');
+    this.digest = info.FormDigestValue;
+    this.digestExpiresAt = Date.now() + Math.max(60000, (Number(info.FormDigestTimeoutSeconds) - 60) * 1000 || 14 * 60 * 1000);
+    return this.digest;
+  };
+
+  PeopleClient.prototype.buildQueryParameters = function (query, options) {
+    options = options || {};
+    var parameters = {
+      QueryString: collapseSpaces(query),
+      MaximumEntitySuggestions: Math.max(1, Number(options.maximumSuggestions) || this.config.maximumSuggestions),
+      AllowEmailAddresses: options.allowEmailAddresses !== false,
+      AllowMultipleEntities: false,
+      AllUrlZones: false,
+      PrincipalSource: Number.isFinite(Number(options.principalSource)) ? Number(options.principalSource) : this.config.principalSource,
+      PrincipalType: Number.isFinite(Number(options.principalType)) ? Number(options.principalType) : this.config.principalType
+    };
+    var groupId = Number(options.sharePointGroupId || options.sharePointGroupID || this.config.sharePointGroupId) || 0;
+    if (groupId > 0) parameters.SharePointGroupID = groupId;
+    return parameters;
+  };
+
+  PeopleClient.prototype.searchRemote = async function (query, options) {
+    if (!this.ready) await this.initialize();
+    var digest = await this.getDigest();
+    var result = await this.request(
+      this.siteUrl + '/_api/SP.UI.ApplicationPages.ClientPeoplePickerWebServiceInterface.clientPeoplePickerSearchUser',
+      {
+        method: 'POST',
+        signal: options && options.signal,
+        headers: {
+          'Content-Type': 'application/json;odata=verbose',
+          'X-RequestDigest': digest
+        },
+        body: JSON.stringify({ queryParams: this.buildQueryParameters(query, options) })
+      }
+    );
+    var responseValue = unwrap(result.payload) && unwrap(result.payload).ClientPeoplePickerSearchUser;
+    var entries = [];
+    if (typeof responseValue === 'string') {
+      try { entries = JSON.parse(responseValue || '[]'); } catch (_) { entries = []; }
+    } else if (Array.isArray(responseValue)) {
+      entries = responseValue;
+    }
+    return entries.map(normalizePerson).filter(function (person) { return !!person.displayName; });
+  };
+
+  PeopleClient.prototype.fetchQueryVariants = async function (variants, options) {
+    var self = this;
+    var settled = await Promise.all(variants.map(function (variant) {
+      return self.searchRemote(variant, options).then(function (value) {
+        return { ok: true, value: value };
+      }).catch(function (error) {
+        return { ok: false, error: error };
+      });
+    }));
+    var candidates = [];
+    var firstError = null;
+    var successes = 0;
+    settled.forEach(function (item) {
+      if (item.ok) {
+        successes += 1;
+        candidates = candidates.concat(item.value);
+      } else if (!firstError) {
+        firstError = item.error;
+      }
+    });
+    if (!successes && firstError) throw firstError;
+    return candidates;
+  };
+
+  PeopleClient.prototype.search = async function (query, options) {
+    options = options || {};
+    if (!this.ready) await this.initialize();
+    var cleanQuery = collapseSpaces(query);
+    var minimumLength = Math.max(1, Number(options.minimumQueryLength) || this.config.minimumQueryLength);
+    if (cleanQuery.length < minimumLength) return [];
+
+    var limit = Math.max(1, Number(options.limit || options.maximumSuggestions) || this.config.maximumSuggestions);
+    var effectivePrincipalSource = Number.isFinite(Number(options.principalSource)) ? Number(options.principalSource) : this.config.principalSource;
+    var effectivePrincipalType = Number.isFinite(Number(options.principalType)) ? Number(options.principalType) : this.config.principalType;
+    var effectiveGroupId = Number(options.sharePointGroupId || options.sharePointGroupID || this.config.sharePointGroupId) || 0;
+    var cacheKey = [normalizePersonText(cleanQuery), limit, effectivePrincipalSource, effectivePrincipalType, effectiveGroupId].join('|');
+    var cached = this.cache.get(cacheKey);
+    if (!options.bypassCache && cached && cached.expiresAt > Date.now()) return cached.people.slice();
+    if (!options.bypassCache && this.inflight.has(cacheKey)) return (await this.inflight.get(cacheKey)).slice();
+
+    var self = this;
+    var operation = (async function () {
+      var variants = buildPersonQueryVariants(cleanQuery);
+      var budget = Math.min(variants.length, Math.max(1, Number(options.maximumRemoteQueries) || self.config.maximumRemoteQueries));
+      var primaryCount = Math.min(2, budget);
+      var candidates = await self.fetchQueryVariants(variants.slice(0, primaryCount), options);
+      var ranked = rankPeople(candidates, cleanQuery, limit);
+      if (!ranked.length && budget > primaryCount) {
+        candidates = candidates.concat(await self.fetchQueryVariants(variants.slice(primaryCount, budget), options));
+        ranked = rankPeople(candidates, cleanQuery, limit);
+      }
+      if (self.config.cacheTtlMs > 0) {
+        self.cache.set(cacheKey, { expiresAt: Date.now() + self.config.cacheTtlMs, people: ranked.slice() });
+      }
+      return ranked;
+    }());
+    this.inflight.set(cacheKey, operation);
+    try {
+      return (await operation).slice();
+    } finally {
+      this.inflight.delete(cacheKey);
+    }
+  };
+
+  PeopleClient.prototype.ensureUser = async function (person, options) {
+    options = options || {};
+    if (!this.ready) await this.initialize();
+    var normalized = normalizePerson(person);
+    if (normalized.sharePointId && !options.force) return normalized;
+    var loginName = normalized.loginName || normalized.email;
+    if (!loginName) throw new ForgeSyncError('A login name or email address is required to resolve a SharePoint user ID.');
+    var digest = await this.getDigest();
+    var result = await this.request(this.siteUrl + '/_api/web/ensureuser', {
+      method: 'POST',
+      signal: options.signal,
+      headers: {
+        'Content-Type': 'application/json;odata=verbose',
+        'X-RequestDigest': digest
+      },
+      body: JSON.stringify({ logonName: loginName })
+    });
+    var ensured = unwrap(result.payload) || {};
+    return normalizePerson({
+      displayName: ensured.Title || normalized.displayName,
+      email: ensured.Email || normalized.email,
+      loginName: ensured.LoginName || loginName,
+      sharePointId: ensured.Id || normalized.sharePointId,
+      department: normalized.department,
+      jobTitle: normalized.jobTitle,
+      raw: ensured
+    });
+  };
+
+  PeopleClient.prototype.getCurrentUser = async function (options) {
+    if (!this.ready) await this.initialize();
+    var result = await this.request(this.siteUrl + '/_api/web/currentuser?$select=Id,Title,Email,LoginName', options || {});
+    return normalizePerson(unwrap(result.payload) || {});
+  };
+
+  PeopleClient.prototype.clearCache = function () {
+    this.cache.clear();
+  };
+
+  function injectPeoplePickerStyles(documentRef) {
+    if (!documentRef || documentRef.getElementById('forge-people-picker-styles')) return;
+    var style = documentRef.createElement('style');
+    style.id = 'forge-people-picker-styles';
+    style.textContent = [
+      '.forge-people-picker{position:relative;display:block;width:100%}',
+      '.forge-people-picker>input{box-sizing:border-box;width:100%}',
+      '.forge-people-results{position:absolute;z-index:10000;top:calc(100% + 5px);left:0;right:0;max-height:280px;overflow:auto;padding:6px;border:1px solid #cbd5e1;border-radius:9px;background:#fff;box-shadow:0 14px 32px rgba(15,23,42,.2)}',
+      '.forge-people-results[hidden]{display:none}',
+      '.forge-people-option{display:block;width:100%;padding:10px;border:0;border-radius:6px;background:transparent;color:#172033;text-align:left;cursor:pointer}',
+      '.forge-people-option:hover,.forge-people-option.is-active{background:#eef4ff}',
+      '.forge-people-option strong,.forge-people-option span{display:block}',
+      '.forge-people-option strong{font-size:13px}',
+      '.forge-people-option span,.forge-people-status{color:#64748b;font-size:11px;line-height:1.4}',
+      '.forge-people-option .forge-people-id{margin-top:2px;color:#5543a5;font-weight:700}',
+      '.forge-people-status{min-height:16px;margin-top:4px}',
+      '.forge-people-status.is-selected{color:#276749;font-weight:700}',
+      '.forge-people-message{padding:10px;color:#64748b;font-size:12px}'
+    ].join('');
+    (documentRef.head || documentRef.documentElement).appendChild(style);
+  }
+
+  function dispatchPeopleEvent(input, name, detail) {
+    var event;
+    try {
+      event = new global.CustomEvent(name, { bubbles: true, detail: detail });
+    } catch (_) {
+      event = input.ownerDocument.createEvent('CustomEvent');
+      event.initCustomEvent(name, true, false, detail);
+    }
+    input.dispatchEvent(event);
+  }
+
+  function dispatchNativeEvent(input, name) {
+    var event;
+    try {
+      event = new global.Event(name, { bubbles: true });
+    } catch (_) {
+      event = input.ownerDocument.createEvent('Event');
+      event.initEvent(name, true, false);
+    }
+    input.dispatchEvent(event);
+  }
+
+  PeopleClient.prototype.attachAutocomplete = function (inputOrSelector, options) {
+    options = options || {};
+    var documentRef = options.document || global.document;
+    if (!documentRef) throw new Error('attachAutocomplete requires a browser document.');
+    var input = typeof inputOrSelector === 'string' ? documentRef.querySelector(inputOrSelector) : inputOrSelector;
+    if (!input || !input.parentNode) throw new Error('attachAutocomplete requires an input element or a selector that matches one input.');
+    if (!options.unstyled) injectPeoplePickerStyles(documentRef);
+
+    var self = this;
+    var originalParent = input.parentNode;
+    var originalNextSibling = input.nextSibling;
+    var originalAttributes = {
+      role: input.getAttribute('role'),
+      autocomplete: input.getAttribute('autocomplete'),
+      expanded: input.getAttribute('aria-expanded'),
+      controls: input.getAttribute('aria-controls'),
+      autocompleteAria: input.getAttribute('aria-autocomplete')
+    };
+    var shell = documentRef.createElement('div');
+    shell.className = options.containerClass || 'forge-people-picker';
+    originalParent.insertBefore(shell, input);
+    shell.appendChild(input);
+    var menu = documentRef.createElement('div');
+    var menuId = (input.id || 'forge-people-' + uuid()) + '-results';
+    menu.id = menuId;
+    menu.className = options.resultsClass || 'forge-people-results';
+    menu.setAttribute('role', 'listbox');
+    menu.hidden = true;
+    shell.appendChild(menu);
+    var status = documentRef.createElement('div');
+    status.className = options.statusClass || 'forge-people-status';
+    status.setAttribute('aria-live', 'polite');
+    shell.appendChild(status);
+
+    input.setAttribute('role', 'combobox');
+    input.setAttribute('autocomplete', 'off');
+    input.setAttribute('aria-autocomplete', 'list');
+    input.setAttribute('aria-expanded', 'false');
+    input.setAttribute('aria-controls', menuId);
+
+    var state = { activeIndex: -1, results: [], timer: 0, sequence: 0, destroyed: false };
+    var minimumLength = Math.max(1, Number(options.minimumQueryLength) || this.config.minimumQueryLength);
+    var debounceMs = options.debounceMs == null ? this.config.debounceMs : Math.max(0, Number(options.debounceMs) || 0);
+
+    function setStatus(message, selected) {
+      status.textContent = message || '';
+      status.classList.toggle('is-selected', !!selected);
+    }
+
+    function close() {
+      state.sequence += 1;
+      clearTimeout(state.timer);
+      state.timer = 0;
+      state.activeIndex = -1;
+      state.results = [];
+      menu.hidden = true;
+      menu.innerHTML = '';
+      input.setAttribute('aria-expanded', 'false');
+    }
+
+    function updateActiveOption() {
+      Array.prototype.forEach.call(menu.querySelectorAll('[data-forge-person-index]'), function (option, index) {
+        var active = index === state.activeIndex;
+        option.classList.toggle('is-active', active);
+        option.setAttribute('aria-selected', active ? 'true' : 'false');
+        if (active && option.scrollIntoView) option.scrollIntoView({ block: 'nearest' });
+      });
+    }
+
+    function renderResults(people, message) {
+      state.results = people || [];
+      state.activeIndex = state.results.length ? 0 : -1;
+      if (!state.results.length) {
+        menu.innerHTML = '<div class="forge-people-message">' + escapeMarkup(message || options.noResultsText || 'No matching people found.') + '</div>';
+      } else {
+        menu.innerHTML = state.results.map(function (person, index) {
+          var identity = person.email || person.loginName || '';
+          var idLine = person.sharePointId ? 'SharePoint ID ' + person.sharePointId : 'Select to resolve SharePoint ID';
+          return '<button type="button" class="forge-people-option' + (index === 0 ? ' is-active' : '') + '" role="option" aria-selected="' + (index === 0 ? 'true' : 'false') + '" data-forge-person-index="' + index + '">' +
+            '<strong>' + escapeMarkup(person.displayName) + '</strong>' +
+            (identity ? '<span>' + escapeMarkup(identity) + '</span>' : '') +
+            '<span class="forge-people-id">' + escapeMarkup(idLine) + '</span></button>';
+        }).join('');
+      }
+      menu.hidden = false;
+      input.setAttribute('aria-expanded', 'true');
+    }
+
+    function applyPerson(person) {
+      input.value = person.displayName;
+      input.dataset.spUserId = person.sharePointId || '';
+      input.dataset.spLoginName = person.loginName || '';
+      input.dataset.spEmail = person.email || '';
+      input.dataset.personDisplayName = person.displayName || '';
+      setStatus(
+        person.sharePointId ? 'Selected SharePoint ID: ' + person.sharePointId + (person.email ? ' · ' + person.email : '') : 'Selected tenant identity',
+        true
+      );
+      dispatchPeopleEvent(input, 'forgepeople:select', { person: person, client: self });
+      if (typeof options.onSelect === 'function') options.onSelect(person, input);
+      return person;
+    }
+
+    async function selectPerson(person) {
+      close();
+      input.setAttribute('aria-busy', 'true');
+      setStatus(options.resolvingText || 'Resolving SharePoint ID…');
+      try {
+        var resolved = options.ensureUser === false ? normalizePerson(person) : await self.ensureUser(person);
+        applyPerson(resolved);
+        dispatchNativeEvent(input, 'input');
+        dispatchNativeEvent(input, 'change');
+        return resolved;
+      } catch (error) {
+        setStatus(error.message || 'Unable to resolve this SharePoint identity.');
+        dispatchPeopleEvent(input, 'forgepeople:error', { error: error, client: self });
+        if (typeof options.onError === 'function') options.onError(error, input);
+        throw error;
+      } finally {
+        input.removeAttribute('aria-busy');
+        input.focus();
+      }
+    }
+
+    async function searchNow() {
+      var query = collapseSpaces(input.value);
+      var sequence = ++state.sequence;
+      if (query.length < minimumLength) {
+        close();
+        setStatus(options.promptText || 'Type at least ' + minimumLength + ' characters to search SharePoint people.');
+        return [];
+      }
+      renderResults([], options.searchingText || 'Searching SharePoint people…');
+      try {
+        var people = await self.search(query, {
+          limit: options.maximumSuggestions,
+          maximumRemoteQueries: options.maximumRemoteQueries,
+          sharePointGroupId: options.sharePointGroupId,
+          principalSource: options.principalSource,
+          principalType: options.principalType
+        });
+        if (state.destroyed || sequence !== state.sequence || collapseSpaces(input.value) !== query) return [];
+        renderResults(people, options.noResultsText || 'No matching people found.');
+        setStatus(people.length ? (options.resultsText || 'Choose a person to retain their SharePoint ID.') : (options.noResultsText || 'No matching people found.'));
+        dispatchPeopleEvent(input, 'forgepeople:results', { query: query, people: people, client: self });
+        if (typeof options.onResults === 'function') options.onResults(people, query, input);
+        return people;
+      } catch (error) {
+        if (state.destroyed || sequence !== state.sequence) return [];
+        renderResults([], error.message || 'Unable to search SharePoint people.');
+        setStatus(error.message || 'Unable to search SharePoint people.');
+        dispatchPeopleEvent(input, 'forgepeople:error', { error: error, client: self });
+        if (typeof options.onError === 'function') options.onError(error, input);
+        return [];
+      }
+    }
+
+    function scheduleSearch() {
+      var typed = collapseSpaces(input.value);
+      if (input.dataset.personDisplayName && typed !== input.dataset.personDisplayName) {
+        input.dataset.spUserId = '';
+        input.dataset.spLoginName = '';
+        input.dataset.spEmail = '';
+        input.dataset.personDisplayName = '';
+      }
+      if (input.dataset.spUserId && typed === input.dataset.personDisplayName) {
+        close();
+        return;
+      }
+      clearTimeout(state.timer);
+      state.timer = setTimeout(searchNow, debounceMs);
+    }
+
+    function onInput() { scheduleSearch(); }
+    function onFocus() {
+      if (collapseSpaces(input.value).length >= minimumLength && !input.dataset.spUserId) scheduleSearch();
+    }
+    function onKeydown(event) {
+      if (menu.hidden) return;
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        var count = state.results.length;
+        if (count) state.activeIndex = (state.activeIndex + (event.key === 'ArrowDown' ? 1 : -1) + count) % count;
+        updateActiveOption();
+      } else if (event.key === 'Enter') {
+        event.preventDefault();
+        event.stopPropagation();
+        if (state.results[state.activeIndex]) selectPerson(state.results[state.activeIndex]).catch(function () {});
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        close();
+      } else if (event.key === 'Tab') {
+        close();
+      }
+    }
+    function onMenuMouseDown(event) {
+      var option = event.target.closest && event.target.closest('[data-forge-person-index]');
+      if (option) event.preventDefault();
+    }
+    function onMenuClick(event) {
+      var option = event.target.closest && event.target.closest('[data-forge-person-index]');
+      if (!option) return;
+      var person = state.results[Number(option.getAttribute('data-forge-person-index'))];
+      if (person) selectPerson(person).catch(function () {});
+    }
+    function onDocumentMouseDown(event) { if (!shell.contains(event.target)) close(); }
+
+    input.addEventListener('input', onInput);
+    input.addEventListener('focus', onFocus);
+    input.addEventListener('keydown', onKeydown);
+    menu.addEventListener('mousedown', onMenuMouseDown);
+    menu.addEventListener('click', onMenuClick);
+    documentRef.addEventListener('mousedown', onDocumentMouseDown);
+    setStatus(options.promptText || 'Type at least ' + minimumLength + ' characters to search SharePoint people.');
+
+    return {
+      input: input,
+      container: shell,
+      resultsElement: menu,
+      statusElement: status,
+      search: searchNow,
+      close: close,
+      clear: function () {
+        input.value = '';
+        input.dataset.spUserId = '';
+        input.dataset.spLoginName = '';
+        input.dataset.spEmail = '';
+        input.dataset.personDisplayName = '';
+        close();
+        setStatus(options.promptText || 'Type at least ' + minimumLength + ' characters to search SharePoint people.');
+      },
+      getSelection: function () {
+        if (!input.dataset.spUserId && !input.dataset.spLoginName) return null;
+        return normalizePerson({
+          displayName: input.dataset.personDisplayName || input.value,
+          sharePointId: input.dataset.spUserId,
+          loginName: input.dataset.spLoginName,
+          email: input.dataset.spEmail
+        });
+      },
+      setSelection: async function (person) { return selectPerson(normalizePerson(person)); },
+      destroy: function () {
+        if (state.destroyed) return;
+        state.destroyed = true;
+        close();
+        input.removeEventListener('input', onInput);
+        input.removeEventListener('focus', onFocus);
+        input.removeEventListener('keydown', onKeydown);
+        menu.removeEventListener('mousedown', onMenuMouseDown);
+        menu.removeEventListener('click', onMenuClick);
+        documentRef.removeEventListener('mousedown', onDocumentMouseDown);
+        originalParent.insertBefore(input, shell);
+        shell.remove();
+        Object.keys(originalAttributes).forEach(function (key) {
+          var attributeName = key === 'autocompleteAria' ? 'aria-autocomplete' : (key === 'expanded' ? 'aria-expanded' : (key === 'controls' ? 'aria-controls' : key));
+          var value = originalAttributes[key];
+          if (value == null) input.removeAttribute(attributeName); else input.setAttribute(attributeName, value);
+        });
+        if (originalNextSibling && originalNextSibling.parentNode === originalParent && input.nextSibling !== originalNextSibling) {
+          originalParent.insertBefore(input, originalNextSibling);
+        }
+      }
+    };
+  };
+
+  function recordIdFromDefault(record) {
+    return record && (record.id != null ? record.id : record.Id);
+  }
+
+  function mergeArrays(base, local, server, path, conflicts) {
+    var allObjectsWithIds = [base, local, server].every(function (list) {
+      return Array.isArray(list) && list.every(function (item) {
+        return isObject(item) && (item.id != null || item.Id != null);
+      });
+    });
+    if (!allObjectsWithIds) {
+      if (equal(local, server)) return clone(local);
+      if (equal(local, base)) return clone(server);
+      if (equal(server, base)) return clone(local);
+      conflicts.push({ path: path, local: clone(local), server: clone(server) });
+      return clone(local);
+    }
+    var baseMap = new Map();
+    var localMap = new Map();
+    var serverMap = new Map();
+    base.forEach(function (item) { baseMap.set(String(item.id != null ? item.id : item.Id), item); });
+    local.forEach(function (item) { localMap.set(String(item.id != null ? item.id : item.Id), item); });
+    server.forEach(function (item) { serverMap.set(String(item.id != null ? item.id : item.Id), item); });
+    var order = [];
+    local.concat(server).forEach(function (item) {
+      var id = String(item.id != null ? item.id : item.Id);
+      if (order.indexOf(id) === -1) order.push(id);
+    });
+    return order.map(function (id) {
+      return mergeValue(baseMap.get(id), localMap.get(id), serverMap.get(id), path + '[' + id + ']', conflicts);
+    }).filter(function (item) { return item !== undefined; });
+  }
+
+  function mergeValue(base, local, server, path, conflicts) {
+    if (equal(local, server)) return clone(local);
+    if (equal(local, base)) return clone(server);
+    if (equal(server, base)) return clone(local);
+    if (Array.isArray(local) && Array.isArray(server) && Array.isArray(base || [])) {
+      return mergeArrays(base || [], local, server, path, conflicts);
+    }
+    if (isObject(local) && isObject(server)) {
+      var output = {};
+      var keys = new Set(Object.keys(base || {}).concat(Object.keys(local), Object.keys(server)));
+      keys.forEach(function (key) {
+        var value = mergeValue(base && base[key], local[key], server[key], path ? path + '.' + key : key, conflicts);
+        if (value !== undefined) output[key] = value;
+      });
+      return output;
+    }
+    conflicts.push({ path: path, local: clone(local), server: clone(server) });
+    return clone(local);
+  }
+
+  function defaultThreeWayMerge(base, local, server) {
+    var conflicts = [];
+    var record = mergeValue(base || {}, local || {}, server || {}, '', conflicts);
+    if (isObject(record) && conflicts.length) record._forgeConflicts = conflicts;
+    return { record: record, conflicts: conflicts };
+  }
+
+
+  function SyncClient(options) {
+    if (!options || !String(options.listTitle || '').trim()) throw new Error('ForgeSharePointSync requires listTitle.');
+    if (!/[0-9a-f]{10}$/i.test(String(options.listTitle).trim())) throw new Error('ForgeSharePointSync listTitle must end in one persisted 10-character hexadecimal suffix.');
+    if (!String(options.itemType || '').trim()) throw new Error('ForgeSharePointSync requires itemType.');
+    this.options = options;
+    
+    this.config = {
+      activePollMs: Number(options.activePollMs) || 4000,
+      idlePollMs: Number(options.idlePollMs) || 12000,
+      hiddenPollMs: Number(options.hiddenPollMs) || 45000,
+      pollJitterRatio: Number.isFinite(Number(options.pollJitterRatio)) ? Number(options.pollJitterRatio) : 0.25,
+      maxBackoffMs: Number(options.maxBackoffMs) || 120000,
+      leaderLeaseMs: Number(options.leaderLeaseMs) || 15000,
+      requestTimeoutMs: Number(options.requestTimeoutMs) || 15000,
+      contextTimeoutMs: Number(options.contextTimeoutMs) || 10000,
+      fullReconcileMs: Number(options.fullReconcileMs) || 5 * 60 * 1000,
+      watermarkOverlapMs: Number(options.watermarkOverlapMs) || 2500
+    };
+    this.listTitle = String(options.listTitle).trim();
+    this.itemType = String(options.itemType).trim();
+    this.getRecordId = typeof options.getRecordId === 'function' ? options.getRecordId : recordIdFromDefault;
+    this.onRecordsChanged = typeof options.onRecordsChanged === 'function' ? options.onRecordsChanged : function () {};
+    this.onStatusChange = typeof options.onStatusChange === 'function' ? options.onStatusChange : function () {};
+    this.mergeRecord = typeof options.mergeRecord === 'function' ? options.mergeRecord : null;
+    this.siteUrl = '';
+    this.entityType = '';
+    this.digest = '';
+    this.digestExpiresAt = 0;
+    this.ready = false;
+    this.started = false;
+    this.pollTimer = 0;
+    this.pollInFlight = false;
+    this.emptyPolls = 0;
+    this.backoffMs = 0;
+    this.activeUntil = 0;
+    this.lastFullReconcileAt = 0;
+    this.watermark = '';
+    this.records = new Map();
+    this.seenVersions = new Map();
+    this.pendingWrites = new Map();
+    this.storage = safeStorage();
+    this.clientId = this.getStableClientId();
+    this.operationSequence = 0;
+    this.channel = null;
+    this.leaderId = uuid();
+    this.isLeader = false;
+    this.leaseKey = '__forge_sync_leader__:' + this.listTitle + ':' + this.itemType;
+    this.channelName = 'forge-sync:' + (this.listTitle + ':' + this.itemType).replace(/[^a-z0-9_-]+/gi, '-').slice(0, 80);
+    this.boundPageHide = this.releaseLeadership.bind(this);
+    this.boundOnline = this.handleOnline.bind(this);
+    this.boundVisibility = this.handleVisibility.bind(this);
+  }
+
+  SyncClient.prototype.getStableClientId = function () {
+    var key = '__forge_sync_client_id__';
+    var current = this.storage.getItem(key);
+    if (current) return current;
+    current = uuid();
+    this.storage.setItem(key, current);
+    return current;
+  };
+
+  SyncClient.prototype.emitStatus = function (state, message, details) {
+    var payload = { state: state, message: message || state, details: details || null, at: new Date().toISOString() };
+    try { this.onStatusChange(payload); } catch (_) {}
+  };
+
+  SyncClient.prototype.waitForSharePointContext = async function () {
+    return waitForSharePointSiteUrl(this.config.contextTimeoutMs);
+  };
+
+  SyncClient.prototype.request = async function (url, options) {
+    options = options || {};
+    var controller = new AbortController();
+    var timer = setTimeout(function () { controller.abort(); }, options.timeoutMs || this.config.requestTimeoutMs);
+    var headers = Object.assign({ Accept: 'application/json;odata=verbose' }, options.headers || {});
+    try {
+      var response = await fetch(url, {
+        method: options.method || 'GET',
+        credentials: 'include',
+        headers: headers,
+        body: options.body,
+        signal: controller.signal
+      });
+      var text = await response.text();
+      var payload = null;
+      if (text) {
+        try { payload = JSON.parse(text); } catch (_) { payload = null; }
+      }
+      if (!response.ok) {
+        throw new ForgeSyncError('SharePoint request failed (' + response.status + '): ' + (text || response.statusText), {
+          status: response.status,
+          responseText: text,
+          retryAfterMs: responseRetryAfterMs(response)
+        });
+      }
+      return { response: response, payload: payload, text: text };
+    } catch (error) {
+      if (error && error.name === 'AbortError') throw new ForgeSyncError('SharePoint request timed out.');
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  SyncClient.prototype.getDigest = async function () {
+    if (this.digest && Date.now() < this.digestExpiresAt) return this.digest;
+    var result = await this.request(this.siteUrl + '/_api/contextinfo', { method: 'POST' });
+    var info = unwrap(result.payload) && unwrap(result.payload).GetContextWebInformation;
+    if (!info || !info.FormDigestValue) throw new ForgeSyncError('SharePoint returned no request digest.');
+    this.digest = info.FormDigestValue;
+    this.digestExpiresAt = Date.now() + Math.max(60000, (Number(info.FormDigestTimeoutSeconds) - 60) * 1000 || 14 * 60 * 1000);
+    return this.digest;
+  };
+
+  SyncClient.prototype.withRetry = async function (operation, options) {
+    options = options || {};
+    var attempts = Number(options.attempts) || 6;
+    var delay = Number(options.delayMs) || 350;
+    var lastError;
+    for (var attempt = 0; attempt < attempts; attempt += 1) {
+      try { return await operation(attempt); } catch (error) {
+        lastError = error;
+        var transient = error && (error.status === 404 || error.status === 409 || error.status === 429 || error.status === 503 || error.status === 0);
+        if (!transient || attempt === attempts - 1) throw error;
+        var retry = error.retryAfterMs || Math.min(5000, delay * Math.pow(2, attempt));
+        await sleep(this.jitter(retry));
+      }
+    }
+    throw lastError;
+  };
+
+  SyncClient.prototype.listUrl = function () {
+    return this.siteUrl + "/_api/web/lists/getbytitle('" + odataEscape(this.listTitle) + "')";
+  };
+
+  SyncClient.prototype.getListMetadata = async function () {
+    var result = await this.request(this.listUrl() + '?$select=Id,Title,ListItemEntityTypeFullName');
+    return unwrap(result.payload);
+  };
+
+  SyncClient.prototype.createList = async function () {
+    var digest = await this.getDigest();
+    await this.request(this.siteUrl + '/_api/web/lists', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json;odata=verbose', 'X-RequestDigest': digest },
+      body: JSON.stringify({ __metadata: { type: 'SP.List' }, BaseTemplate: 100, Title: this.listTitle })
+    });
+  };
+
+  SyncClient.prototype.getFields = async function () {
+    var result = await this.request(this.listUrl() + '/fields?$select=Title,InternalName,TypeAsString');
+    return results(result.payload);
+  };
+
+  SyncClient.prototype.createField = async function (schemaXml) {
+    var digest = await this.getDigest();
+    await this.request(this.listUrl() + '/fields/createfieldasxml', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json;odata=verbose', 'X-RequestDigest': digest },
+      body: JSON.stringify({
+        parameters: {
+          __metadata: { type: 'SP.XmlSchemaFieldCreationInformation' },
+          SchemaXml: schemaXml,
+          Options: 0
+        }
+      })
+    });
+  };
+
+  SyncClient.prototype.findField = function (fields, name) {
+    return fields.find(function (field) { return field.InternalName === name || field.Title === name; });
+  };
+
+  SyncClient.prototype.ensureField = async function (name, type) {
+    var self = this;
+    var fields = await this.withRetry(function () { return self.getFields(); });
+    var field = this.findField(fields, name);
+    if (!field) {
+      try {
+        await this.createField(REQUIRED_FIELDS[name]);
+      } catch (error) {
+        if (!error || (error.status !== 400 && error.status !== 409)) throw error;
+      }
+      fields = await this.withRetry(async function () {
+        var refreshed = await self.getFields();
+        if (!self.findField(refreshed, name)) throw new ForgeSyncError('Field ' + name + ' is still propagating.', { status: 404 });
+        return refreshed;
+      });
+      field = this.findField(fields, name);
+    }
+    if (!field || field.TypeAsString !== type) {
+      throw new ForgeSyncError('SharePoint field ' + name + ' must be ' + type + ', but is ' + (field && field.TypeAsString || 'missing') + '.');
+    }
+  };
+
+  SyncClient.prototype.ensureListAndFields = async function () {
+    var self = this;
+    var metadata;
+    try { metadata = await this.getListMetadata(); } catch (error) {
+      if (!error || error.status !== 404) throw error;
+      try {
+        await this.createList();
+      } catch (createError) {
+        if (!createError || (createError.status !== 400 && createError.status !== 409)) throw createError;
+      }
+      metadata = await this.withRetry(function () { return self.getListMetadata(); });
+    }
+    await this.ensureField('ItemType', 'Text');
+    await this.ensureField('DataJson', 'Note');
+    var fields = await this.withRetry(function () { return self.getFields(); });
+    var itemType = this.findField(fields, 'ItemType');
+    var dataJson = this.findField(fields, 'DataJson');
+    if (!itemType || itemType.TypeAsString !== 'Text' || !dataJson || dataJson.TypeAsString !== 'Note') {
+      throw new ForgeSyncError('SharePoint list is not ready: ItemType must be Text and DataJson must be Note.');
+    }
+    metadata = await this.getListMetadata();
+    this.entityType = metadata && metadata.ListItemEntityTypeFullName || '';
+    if (!this.entityType) throw new ForgeSyncError('SharePoint returned no ListItemEntityTypeFullName.');
+  };
+
+  SyncClient.prototype.initialize = async function () {
+    this.emitStatus('connecting', 'Connecting to SharePoint...');
+    this.siteUrl = await this.waitForSharePointContext();
+    this.leaseKey = '__forge_sync_leader__:' + this.siteUrl + ':' + this.listTitle + ':' + this.itemType;
+    this.channelName = 'forge-sync:' + (this.siteUrl + ':' + this.listTitle + ':' + this.itemType).replace(/[^a-z0-9_-]+/gi, '-').slice(-120);
+    await this.ensureListAndFields();
+    this.ready = true;
+    this.emitStatus('ready', 'SharePoint is ready.');
+    return this;
+  };
+
+  SyncClient.prototype.jitter = function (ms) {
+    var ratio = Math.max(0, Math.min(0.75, this.config.pollJitterRatio));
+    return Math.max(100, Math.round(ms * (1 - ratio + Math.random() * ratio * 2)));
+  };
+
+  SyncClient.prototype.readLease = function () {
+    try { return JSON.parse(this.storage.getItem(this.leaseKey) || 'null'); } catch (_) { return null; }
+  };
+
+  SyncClient.prototype.tryLeadership = function () {
+    var now = Date.now();
+    var lease = this.readLease();
+    if (lease && lease.id !== this.leaderId && Number(lease.expiresAt) > now) {
+      this.isLeader = false;
+      return false;
+    }
+    this.storage.setItem(this.leaseKey, JSON.stringify({ id: this.leaderId, expiresAt: now + this.config.leaderLeaseMs }));
+    lease = this.readLease();
+    this.isLeader = !!lease && lease.id === this.leaderId;
+    return this.isLeader;
+  };
+
+  SyncClient.prototype.renewLeadership = function () {
+    if (!this.isLeader) return this.tryLeadership();
+    this.storage.setItem(this.leaseKey, JSON.stringify({ id: this.leaderId, expiresAt: Date.now() + this.config.leaderLeaseMs }));
+    return true;
+  };
+
+  SyncClient.prototype.releaseLeadership = function () {
+    var lease = this.readLease();
+    if (lease && lease.id === this.leaderId) this.storage.removeItem(this.leaseKey);
+    this.isLeader = false;
+  };
+
+  SyncClient.prototype.setupChannel = function () {
+    if (typeof global.BroadcastChannel !== 'function') return;
+    var self = this;
+    this.channel = new global.BroadcastChannel(this.channelName);
+    this.channel.onmessage = function (event) {
+      var message = event && event.data;
+      if (!message || message.sender === self.leaderId) return;
+      if (message.type === 'deltas') self.applyBroadcastDeltas(message.payload);
+      if (message.type === 'activity') self.activeUntil = Math.max(self.activeUntil, Date.now() + 30000);
+      if (message.type === 'hello' && self.isLeader) {
+        self.broadcast('deltas', { source: 'leader', upserts: self.getRecords(), deletes: [] });
+      }
+    };
+    this.broadcast('hello', null);
+  };
+
+  SyncClient.prototype.broadcast = function (type, payload) {
+    if (!this.channel) return;
+    try { this.channel.postMessage({ type: type, payload: payload, sender: this.leaderId }); } catch (_) {}
+  };
+
+  SyncClient.prototype.decorateRecord = function (record, operationId) {
+    var output = clone(record) || {};
+    output._forgeSync = Object.assign({}, output._forgeSync || {}, {
+      clientId: this.clientId,
+      operationId: operationId,
+      runtimeVersion: VERSION
+    });
+    return output;
+  };
+
+  SyncClient.prototype.parseItem = function (item) {
+    var data;
+    try { data = JSON.parse(item.DataJson || '{}'); } catch (_) { return null; }
+    return {
+      id: String(this.getRecordId(data)),
+      data: data,
+      spId: Number(item.Id),
+      etag: itemEtag(item),
+      modified: String(item.Modified || ''),
+      base: clone(data)
+    };
+  };
+
+  SyncClient.prototype.buildItemsUrl = function (full) {
+    var select = '$select=Id,Title,ItemType,DataJson,Modified';
+    var query = select;
+    if (!full && this.watermark) {
+      var overlap = new Date(Math.max(0, Date.parse(this.watermark) - this.config.watermarkOverlapMs)).toISOString();
+      query += "&$filter=Modified ge datetime'" + odataEscape(overlap) + "'";
+    }
+    query += '&$orderby=Modified asc,Id asc&$top=5000';
+    return this.listUrl() + '/items?' + query;
+  };
+
+  SyncClient.prototype.fetchPagedItems = async function (url) {
+    var items = [];
+    var next = url;
+    while (next) {
+      var result = await this.request(next);
+      items = items.concat(results(result.payload));
+      next = nextLink(result.payload);
+    }
+    return items;
+  };
+
+  SyncClient.prototype.applyItems = function (items, source, full) {
+    var upserts = [];
+    var deletes = [];
+    var present = new Set();
+    var maxModified = this.watermark;
+    var self = this;
+    items.forEach(function (item) {
+      if (item.ItemType !== self.itemType || !item.DataJson) return;
+      var parsed = self.parseItem(item);
+      if (!parsed || !parsed.id || parsed.id === 'undefined') return;
+      present.add(parsed.id);
+      var version = parsed.spId + '|' + parsed.modified + '|' + parsed.etag;
+      if (self.seenVersions.get(parsed.id) === version) return;
+      self.seenVersions.set(parsed.id, version);
+      if (!maxModified || Date.parse(parsed.modified) > Date.parse(maxModified)) maxModified = parsed.modified;
+      if (parsed.data.isDeleted || parsed.data.deletedAt) {
+        self.records.delete(parsed.id);
+        deletes.push(parsed.id);
+      } else {
+        self.records.set(parsed.id, parsed);
+        upserts.push(clone(parsed.data));
+      }
+    });
+    if (full) {
+      Array.from(this.records.keys()).forEach(function (id) {
+        if (!present.has(id)) {
+          self.records.delete(id);
+          deletes.push(id);
+        }
+      });
+    }
+    if (maxModified) this.watermark = maxModified;
+    if (upserts.length || deletes.length) {
+      this.activeUntil = Date.now() + 30000;
+      var change = { source: source, upserts: upserts, deletes: deletes, records: this.getRecords() };
+      try { this.onRecordsChanged(change); } catch (_) {}
+      if (source === 'remote') this.broadcast('deltas', change);
+    }
+    return { upserts: upserts, deletes: deletes };
+  };
+
+  SyncClient.prototype.applyBroadcastDeltas = function (change) {
+    if (!change) return;
+    var self = this;
+    (change.upserts || []).forEach(function (record) {
+      var id = String(self.getRecordId(record));
+      var current = self.records.get(id) || {};
+      self.records.set(id, Object.assign({}, current, { id: id, data: clone(record), base: clone(record) }));
+    });
+    (change.deletes || []).forEach(function (id) { self.records.delete(String(id)); });
+    try { this.onRecordsChanged({ source: 'tab', upserts: clone(change.upserts || []), deletes: clone(change.deletes || []), records: this.getRecords() }); } catch (_) {}
+  };
+
+  SyncClient.prototype.pollOnce = async function (forceFull) {
+    if (!this.ready || this.pollInFlight) return { skipped: true };
+    this.pollInFlight = true;
+    try {
+      var full = !!forceFull || !this.lastFullReconcileAt || Date.now() - this.lastFullReconcileAt >= this.config.fullReconcileMs;
+      var items = await this.fetchPagedItems(this.buildItemsUrl(full));
+      var changes = this.applyItems(items, 'remote', full);
+      if (full) this.lastFullReconcileAt = Date.now();
+      this.emptyPolls = changes.upserts.length || changes.deletes.length ? 0 : this.emptyPolls + 1;
+      this.backoffMs = 0;
+      this.emitStatus('synced', changes.upserts.length || changes.deletes.length ? 'Changes received.' : 'Up to date.');
+      return changes;
+    } finally {
+      this.pollInFlight = false;
+    }
+  };
+
+  SyncClient.prototype.nextPollDelay = function () {
+    if (global.document && global.document.visibilityState === 'hidden') return this.jitter(this.config.hiddenPollMs);
+    if (this.backoffMs) return this.jitter(this.backoffMs);
+    if (Date.now() < this.activeUntil || this.emptyPolls < 3) return this.jitter(this.config.activePollMs);
+    return this.jitter(this.config.idlePollMs);
+  };
+
+  SyncClient.prototype.scheduleNextPoll = function (delay) {
+    var self = this;
+    clearTimeout(this.pollTimer);
+    if (!this.started) return;
+    this.pollTimer = setTimeout(function () { self.pollLoop(); }, Math.max(100, delay == null ? this.nextPollDelay() : delay));
+  };
+
+  SyncClient.prototype.pollLoop = async function () {
+    if (!this.started) return;
+    if (!this.tryLeadership()) {
+      this.scheduleNextPoll(Math.min(5000, Math.round(this.config.leaderLeaseMs / 3)));
+      return;
+    }
+    this.renewLeadership();
+    if (global.navigator && global.navigator.onLine === false) {
+      this.emitStatus('offline', 'Offline; waiting to reconnect.');
+      this.scheduleNextPoll(this.config.idlePollMs);
+      return;
+    }
+    try {
+      await this.pollOnce(false);
+    } catch (error) {
+      var throttled = error && (error.status === 429 || error.status === 503);
+      var next = error && error.retryAfterMs || Math.min(this.config.maxBackoffMs, Math.max(this.config.activePollMs, (this.backoffMs || this.config.activePollMs) * 2));
+      this.backoffMs = next;
+      this.emitStatus(throttled ? 'throttled' : 'error', error.message || 'SharePoint polling failed.', error);
+    }
+    this.scheduleNextPoll();
+  };
+
+  SyncClient.prototype.handleOnline = function () {
+    this.activeUntil = Date.now() + 30000;
+    this.scheduleNextPoll(this.jitter(500));
+  };
+
+  SyncClient.prototype.handleVisibility = function () {
+    if (global.document && global.document.visibilityState === 'visible') {
+      this.activeUntil = Date.now() + 30000;
+      this.scheduleNextPoll(this.jitter(500));
+    }
+  };
+
+  SyncClient.prototype.start = async function () {
+    if (!this.ready) await this.initialize();
+    if (this.started) return this;
+    this.started = true;
+    this.setupChannel();
+    global.addEventListener('pagehide', this.boundPageHide);
+    global.addEventListener('online', this.boundOnline);
+    global.document && global.document.addEventListener('visibilitychange', this.boundVisibility);
+    this.activeUntil = Date.now() + 30000;
+    if (this.tryLeadership()) {
+      try { await this.pollOnce(true); } catch (error) { this.emitStatus('error', error.message || 'Initial SharePoint sync failed.', error); }
+    }
+    this.scheduleNextPoll(this.isLeader ? this.nextPollDelay() : Math.min(5000, Math.round(this.config.leaderLeaseMs / 3)));
+    return this;
+  };
+
+  SyncClient.prototype.stop = function () {
+    this.started = false;
+    clearTimeout(this.pollTimer);
+    this.pollTimer = 0;
+    this.releaseLeadership();
+    if (this.channel) this.channel.close();
+    this.channel = null;
+    global.removeEventListener('pagehide', this.boundPageHide);
+    global.removeEventListener('online', this.boundOnline);
+    global.document && global.document.removeEventListener('visibilitychange', this.boundVisibility);
+  };
+
+  SyncClient.prototype.getRecords = function () {
+    return Array.from(this.records.values()).map(function (entry) { return clone(entry.data); });
+  };
+
+  SyncClient.prototype.getRecord = function (id) {
+    var entry = this.records.get(String(id));
+    return entry ? clone(entry.data) : null;
+  };
+
+  SyncClient.prototype.findServerItem = async function (recordId) {
+    var filter = "$filter=Title eq '" + odataEscape(recordId) + "'&$orderby=Modified desc&$top=1";
+    var items = await this.fetchPagedItems(this.listUrl() + '/items?$select=Id,Title,ItemType,DataJson,Modified&' + filter);
+    var self = this;
+    var item = items.find(function (candidate) { return candidate.ItemType === self.itemType; });
+    return item ? this.parseItem(item) : null;
+  };
+
+  SyncClient.prototype.createServerRecord = async function (recordId, data) {
+    var digest = await this.getDigest();
+    var result;
+    try {
+      result = await this.request(this.listUrl() + '/items', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json;odata=verbose',
+          'X-RequestDigest': digest,
+          Prefer: 'return=representation'
+        },
+        body: JSON.stringify({
+          __metadata: { type: this.entityType },
+          Title: recordId,
+          ItemType: this.itemType,
+          DataJson: JSON.stringify(data)
+        })
+      });
+    } catch (error) {
+      var recovered = await this.findServerItem(recordId).catch(function () { return null; });
+      if (recovered && recovered.data && recovered.data._forgeSync && data._forgeSync && recovered.data._forgeSync.operationId === data._forgeSync.operationId) return recovered;
+      throw error;
+    }
+    var item = unwrap(result.payload);
+    if (!item || !item.Id) item = await this.findServerItem(recordId);
+    else item = { Id: item.Id, Title: item.Title || recordId, ItemType: this.itemType, DataJson: item.DataJson || JSON.stringify(data), Modified: item.Modified, __metadata: item.__metadata };
+    var parsed = item && item.data ? item : this.parseItem(item);
+    if (!parsed) throw new ForgeSyncError('SharePoint created the item but returned no usable representation.');
+    parsed.data = clone(data);
+    parsed.base = clone(data);
+    return parsed;
+  };
+
+  SyncClient.prototype.updateServerRecord = async function (entry, data) {
+    if (!entry || !entry.spId || !entry.etag) throw new ForgeSyncError('Cannot update a record without its SharePoint ID and exact ETag.');
+    var digest = await this.getDigest();
+    var result = await this.request(this.listUrl() + '/items(' + entry.spId + ')', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json;odata=verbose',
+        'X-RequestDigest': digest,
+        'X-HTTP-Method': 'MERGE',
+        'IF-MATCH': entry.etag,
+        Prefer: 'return=representation'
+      },
+      body: JSON.stringify({
+        __metadata: { type: this.entityType },
+        Title: String(this.getRecordId(data)),
+        ItemType: this.itemType,
+        DataJson: JSON.stringify(data)
+      })
+    });
+    var self = this;
+    return this.withRetry(async function () {
+      var refreshed = await self.findServerItem(String(self.getRecordId(data)));
+      if (!refreshed) throw new ForgeSyncError('Updated item is still propagating.', { status: 404 });
+      refreshed.data = clone(data);
+      refreshed.base = clone(data);
+      return refreshed;
+    });
+  };
+
+  SyncClient.prototype.resolveConflict = async function (entry, localData) {
+    var server = await this.findServerItem(String(this.getRecordId(localData)));
+    if (!server) return { record: localData, entry: null, conflicts: [] };
+    var merged;
+    if (this.mergeRecord) {
+      merged = await this.mergeRecord(clone(entry && entry.base || {}), clone(localData), clone(server.data));
+      if (!merged || !merged.record) merged = { record: merged, conflicts: [] };
+    } else {
+      merged = defaultThreeWayMerge(entry && entry.base || {}, localData, server.data);
+    }
+    return { record: merged.record, entry: server, conflicts: merged.conflicts || [] };
+  };
+
+  SyncClient.prototype.persist = async function (record, operationId) {
+    var recordId = String(this.getRecordId(record));
+    if (!recordId || recordId === 'undefined') throw new Error('Every synchronized record needs a stable ID.');
+    var data = this.decorateRecord(record, operationId);
+    var entry = this.records.get(recordId);
+    if (!entry || !entry.spId || !entry.etag) entry = await this.findServerItem(recordId);
+    if (!entry) {
+      entry = await this.createServerRecord(recordId, data);
+    } else {
+      for (var attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          entry = await this.updateServerRecord(entry, data);
+          break;
+        } catch (error) {
+          if (!error || error.status !== 412 || attempt === 2) throw error;
+          var resolved = await this.resolveConflict(entry, data);
+          data = this.decorateRecord(resolved.record, operationId);
+          entry = resolved.entry;
+          if (resolved.conflicts.length) this.emitStatus('conflict', 'Concurrent edits were merged; review highlighted conflicts.', resolved.conflicts);
+        }
+      }
+    }
+    this.records.set(recordId, entry);
+    this.activeUntil = Date.now() + 30000;
+    this.broadcast('activity', { id: recordId });
+    try { this.onRecordsChanged({ source: 'local', upserts: [clone(entry.data)], deletes: [], records: this.getRecords() }); } catch (_) {}
+    if (this.started) this.scheduleNextPoll(this.jitter(500));
+    return clone(entry.data);
+  };
+
+  SyncClient.prototype.drainRecordQueue = async function (recordId) {
+    var queue = this.pendingWrites.get(recordId);
+    if (!queue || queue.running) return;
+    queue.running = true;
+    var result;
+    try {
+      while (queue.latest) {
+        var pending = queue.latest;
+        queue.latest = null;
+        result = await this.persist(pending.record, pending.operationId);
+      }
+      queue.waiters.forEach(function (waiter) { waiter.resolve(clone(result)); });
+    } catch (error) {
+      queue.waiters.forEach(function (waiter) { waiter.reject(error); });
+      this.emitStatus('error', error.message || 'SharePoint write failed.', error);
+    } finally {
+      this.pendingWrites.delete(recordId);
+    }
+  };
+
+  SyncClient.prototype.save = function (record) {
+    var self = this;
+    if (!this.ready) return Promise.reject(new ForgeSyncError('ForgeSharePointSync is not initialized.'));
+    var recordId = String(this.getRecordId(record));
+    if (!recordId || recordId === 'undefined') return Promise.reject(new Error('Every synchronized record needs a stable ID.'));
+    var operationId = this.clientId + ':' + (++this.operationSequence) + ':' + uuid();
+    return new Promise(function (resolve, reject) {
+      var queue = self.pendingWrites.get(recordId);
+      if (!queue) {
+        queue = { latest: null, waiters: [], running: false };
+        self.pendingWrites.set(recordId, queue);
+      }
+      queue.latest = { record: clone(record), operationId: operationId };
+      queue.waiters.push({ resolve: resolve, reject: reject });
+      self.drainRecordQueue(recordId);
+    });
+  };
+
+  SyncClient.prototype.remove = function (recordId) {
+    var current = this.getRecord(recordId) || {};
+    if (current.id == null && current.Id == null) current.id = recordId;
+    current.isDeleted = true;
+    current.deletedAt = new Date().toISOString();
+    return this.save(current);
+  };
+
+  SyncClient.prototype.syncNow = async function () {
+    this.activeUntil = Date.now() + 30000;
+    return this.pollOnce(false);
+  };
+
+  global.ForgeSharePointSync = {
+    VERSION: VERSION,
+    Error: ForgeSyncError,
+    PeopleClient: PeopleClient,
+    defaultThreeWayMerge: defaultThreeWayMerge,
+    createPeopleClient: async function (options) {
+      var client = new PeopleClient(options || {});
+      await client.initialize();
+      return client;
+    },
+    people: {
+      normalizeText: normalizePersonText,
+      normalize: normalizePerson,
+      buildQueryVariants: buildPersonQueryVariants,
+      score: scorePersonMatch,
+      rank: rankPeople,
+      search: async function (query, options) {
+        var client = new PeopleClient(options || {});
+        await client.initialize();
+        return client.search(query, options || {});
+      },
+      ensureUser: async function (person, options) {
+        var client = new PeopleClient(options || {});
+        await client.initialize();
+        return client.ensureUser(person, options || {});
+      }
+    },
+    create: async function (options) {
+      var client = new SyncClient(options || {});
+      await client.initialize();
+      return client;
+    }
+  };
+}(typeof window !== 'undefined' ? window : globalThis));
+
+</script>
+<!-- <script src="devconsole.js"></script> -->
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>tbl_SS_Actions</title>
+    <style>
+        :root {
+            --primary-color: #005a9c;
+            --secondary-color: #f0f0f0;
+            --border-color: #ccc;
+            --hover-color: #e0e0e0;
+            --button-bg: #007bff;
+            --button-hover-bg: #0056b3;
+            --danger-bg: #dc3545;
+            --danger-hover-bg: #c82333;
+            --warning-bg: #ffc107;
+            --warning-text: #212529;
+            --font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        }
+        body {
+            font-family: var(--font-family);
+            background-color: var(--secondary-color);
+            margin: 0;
+            padding: 20px;
+            font-size: 14px;
+        }
+        h1 {
+            color: var(--primary-color);
+            text-align: center;
+            margin-top: 0;
+        }
+        .container {
+            max-width: 95%;
+            margin: auto;
+            background: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+
+        /* Nav tabs */
+        .nav-tabs {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 20px;
+            border-bottom: 2px solid var(--primary-color);
+        }
+        .nav-tab {
+            padding: 12px 24px;
+            border: 1px solid var(--border-color);
+            border-bottom: none;
+            border-radius: 6px 6px 0 0;
+            background: #e9ecef;
+            color: #333;
+            cursor: pointer;
+            font-size: 15px;
+            font-weight: bold;
+        }
+        .nav-tab:hover {
+            background: var(--hover-color);
+        }
+        .nav-tab.active {
+            background: var(--primary-color);
+            color: #fff;
+        }
+
+        /* Views */
+        .view { display: none; }
+        .view.active { display: block; }
+
+        #sync-status {
+            padding: 8px 12px;
+            background-color: #6c757d;
+            color: white;
+            border-radius: 4px;
+            margin-bottom: 20px;
+            text-align: center;
+            font-weight: bold;
+            transition: background-color 0.3s;
+        }
+
+        /* Filter bar */
+        .filter-bar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 14px;
+            align-items: flex-end;
+            margin-bottom: 15px;
+            padding: 15px;
+            background: #f8f9fa;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+        }
+        .filter-group {
+            display: flex;
+            flex-direction: column;
+            min-width: 170px;
+        }
+        .filter-group.search-group {
+            min-width: 240px;
+            flex-grow: 1;
+        }
+        .filter-group label {
+            font-size: 11px;
+            font-weight: bold;
+            margin-bottom: 4px;
+            color: #555;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+        }
+        .filter-group input,
+        .filter-group select {
+            padding: 8px;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        .filter-actions {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            margin-left: auto;
+        }
+        .ticket-count {
+            font-weight: bold;
+            color: #555;
+            white-space: nowrap;
+        }
+        .btn-clear {
+            background-color: #6c757d;
+        }
+        .btn-clear:hover {
+            background-color: #5a6268;
+        }
+
+        .table-container {
+            width: 100%;
+            overflow-x: auto;
+            max-height: 65vh;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            margin-bottom: 20px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th,
+        td {
+            padding: 10px 12px;
+            border: 1px solid var(--border-color);
+            text-align: left;
+            white-space: nowrap;
+            max-width: 320px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        thead th {
+            background-color: var(--primary-color);
+            color: white;
+            position: sticky;
+            top: 0;
+            z-index: 2;
+        }
+        thead th:first-child,
+        tbody td:first-child {
+            position: sticky;
+            left: 0;
+            background-color: #f8f9fa;
+            z-index: 1;
+        }
+        thead th:first-child {
+             background-color: var(--primary-color);
+        }
+        tbody tr:hover {
+            background-color: var(--hover-color);
+        }
+        tbody tr {
+            cursor: pointer;
+        }
+        tr.has-conflict {
+            background-color: #fff3cd;
+        }
+        tr.has-conflict:hover {
+            background-color: #ffeeba;
+        }
+        .status-pill {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+            color: #fff;
+            background: #6c757d;
+            white-space: nowrap;
+        }
+        .status-Closed { background: #28a745; }
+        .status-Approved { background: #007bff; }
+        .status-Cancelled { background: #6c757d; }
+        .status-Returned { background: #dc3545; }
+        .priority-pill {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: bold;
+            white-space: nowrap;
+            background: var(--secondary-color);
+            color: #333;
+            border: 1px solid var(--border-color);
+        }
+        .priority-Workstop { background: #dc3545; color: #fff; border-color: #dc3545; }
+        .priority-Urgent-Critical-Chain { background: #ffc107; color: #212529; border-color: #ffc107; }
+        .priority-Safety { background: #fd7e14; color: #fff; border-color: #fd7e14; }
+
+        .actions {
+            display: flex;
+            gap: 10px;
+        }
+        button {
+            padding: 8px 12px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            color: white;
+            font-size: 14px;
+            font-weight: bold;
+        }
+        .btn-add {
+            background-color: #28a745;
+            margin-bottom: 15px;
+        }
+        .btn-add:hover {
+            background-color: #218838;
+        }
+        .btn-edit {
+            background-color: #ffc107;
+            color: #212529;
+        }
+        .btn-edit:hover {
+            background-color: #e0a800;
+        }
+        .btn-remove {
+            background-color: var(--danger-bg);
+        }
+        .btn-remove:hover {
+            background-color: var(--danger-hover-bg);
+        }
+        .btn-save {
+            background-color: var(--button-bg);
+        }
+        .btn-save:hover {
+            background-color: var(--button-hover-bg);
+        }
+        .btn-cancel {
+            background-color: #6c757d;
+        }
+        .btn-cancel:hover {
+            background-color: #5a6268;
+        }
+        .btn-back {
+            background-color: #6c757d;
+            margin-bottom: 15px;
+        }
+        .btn-back:hover {
+            background-color: #5a6268;
+        }
+
+        /* Edit page (full page, not a modal) */
+        .edit-page-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--border-color);
+            margin-bottom: 20px;
+        }
+        .edit-page-header h2 {
+            margin: 0;
+        }
+        #item-form-container {
+            max-height: 68vh;
+            overflow-y: auto;
+            padding-right: 15px;
+        }
+        .form-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            gap: 15px;
+        }
+        .form-group {
+            display: flex;
+            flex-direction: column;
+        }
+        .form-group.full-width {
+            grid-column: 1 / -1;
+        }
+        .form-group label {
+            margin-bottom: 5px;
+            font-weight: bold;
+            color: #333;
+        }
+        .form-group input,
+        .form-group textarea {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            box-sizing: border-box;
+            font-family: inherit;
+        }
+        .form-group textarea {
+            resize: vertical;
+        }
+
+        .conflict-section {
+            margin-top: 15px;
+            padding: 10px;
+            background-color: #fff3cd;
+            border: 1px solid #ffeeba;
+            border-radius: 4px;
+        }
+        .conflict-section h4 {
+            margin-top: 0;
+            color: var(--warning-text);
+        }
+
+        .conflict-section pre {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            background: #fff;
+            padding: 5px;
+            border-radius: 3px;
+        }
+        .form-actions {
+            margin-top: 20px;
+            padding-top: 20px;
+            border-top: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            gap: 10px;
+        }
+        .form-actions-left,
+        .form-actions-right {
+            display: flex;
+            gap: 10px;
+        }
+
+        /* Metrics placeholder */
+        .metrics-placeholder {
+            text-align: center;
+            padding: 80px 20px;
+            color: #6c757d;
+        }
+        .metrics-placeholder .icon {
+            font-size: 48px;
+            margin-bottom: 10px;
+        }
+        .metrics-placeholder h2 {
+            color: var(--primary-color);
+            margin-bottom: 8px;
+        }
+    </style>
+</head>
+<body>    <div id="wct-unshipped-banner" style="display:none;"></div>
+    <div class="container">
+        <h1>tbl_SS_Actions</h1>
+        <div id="sync-status">Initializing...</div>
+
+        <div class="nav-tabs">
+            <button type="button" class="nav-tab active" id="nav-dashboard" data-view="dashboard">Dashboard</button>
+            <button type="button" class="nav-tab" id="nav-metrics" data-view="metrics">Metrics</button>
+        </div>
+
+        <!-- DASHBOARD VIEW -->
+        <div id="view-dashboard" class="view active">
+            <button type="button" id="add-new-btn" class="btn-add">Add New Item</button>
+
+            <div class="filter-bar">
+                <div class="filter-group search-group">
+                    <label for="filter-search">Search</label>
+                    <input type="text" id="filter-search" placeholder="Tracking ref, title, POC, shop, description...">
+                </div>
+                <div class="filter-group">
+                    <label for="filter-status">Status</label>
+                    <select id="filter-status"><option value="">All Statuses</option></select>
+                </div>
+                <div class="filter-group">
+                    <label for="filter-priority">Priority</label>
+                    <select id="filter-priority"><option value="">All Priorities</option></select>
+                </div>
+                <div class="filter-group">
+                    <label for="filter-phase">Phase</label>
+                    <select id="filter-phase"><option value="">All Phases</option></select>
+                </div>
+                <div class="filter-group">
+                    <label for="filter-itemCategory">Category</label>
+                    <select id="filter-itemCategory"><option value="">All Categories</option></select>
+                </div>
+                <div class="filter-group">
+                    <label for="filter-procType">Proc Type</label>
+                    <select id="filter-procType"><option value="">All Proc Types</option></select>
+                </div>
+                <div class="filter-group">
+                    <label for="filter-assignEng">Assigned Engineer</label>
+                    <select id="filter-assignEng"><option value="">All Engineers</option></select>
+                </div>
+                <div class="filter-actions">
+                    <span class="ticket-count" id="ticket-count">0 of 0 tickets</span>
+                    <button type="button" id="clear-filters-btn" class="btn-clear">Clear Filters</button>
+                </div>
+            </div>
+
+            <div class="table-container">
+                <table id="tbl_SS_Actions">
+                    <thead>
+                        <tr></tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- METRICS VIEW -->
+        <div id="view-metrics" class="view">
+            <div class="metrics-placeholder">
+                <div class="icon">📊</div>
+                <h2>Metrics</h2>
+                <p>Coming soon.</p>
+            </div>
+        </div>
+
+        <!-- EDIT / ADD VIEW (full page, not a modal) -->
+        <div id="view-edit" class="view">
+            <button type="button" id="back-to-dashboard-btn" class="btn-back">&larr; Back to Dashboard</button>
+            <div class="edit-page-header">
+                <h2 id="form-title">Add Item</h2>
+            </div>
+            <div id="item-form-container">
+                <div id="item-form" class="form-grid"></div>
+                <div id="conflict-display" class="conflict-section" style="display:none;">
+                    <h4>Resolve Conflicts</h4>
+                    <p>This item has conflicting changes. Please review your version below and the server version before saving.</p>
+                    <div id="conflict-details"></div>
+                </div>
+            </div>
+            <div class="form-actions">
+                <div class="form-actions-left">
+                    <button type="button" id="remove-from-edit-btn" class="btn-remove" style="display:none;">Remove Item</button>
+                </div>
+                <div class="form-actions-right">
+                    <button type="button" id="cancel-btn" class="btn-cancel">Cancel</button>
+                    <button type="button" id="save-btn" class="btn-save">Save</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script>
+        document.addEventListener('DOMContentLoaded', async () => {
+            const tableHeaders = [
+                'ID', 'TrackingRef', 'Status', 'Priority', 'OrigShop', 'Approved', 'Closed', 'Phase', 'System', 'TIpart',
+                'TImodel', 'TInomen', 'TIcage', 'TIserial', 'ProbDesc', 'POCname', 'POCphone', 'POCemail', 'Createdby',
+                'AssignEng', 'EngNotes', 'Resolution', 'RefTEI', 'RefICP', 'RefICPRev', 'TInotes', 'BenefitShop',
+                'Reqname', 'Reqemail', 'Reqphone', 'DelayReason', 'ShopNameTag', 'ProcType', 'ICPno', 'ICPrevdate',
+                'Cklist', 'LCPno', 'TEInst', 'TitleTicket', 'Interval', 'IntJust', 'WorkNotes', 'MUAperf', 'EngStatus',
+                'QAperf', 'DelayDate', 'InWorkDate', 'delayDays', 'inWorkdays', 'LCPfuture', 'LCPinfolder', 'Cklistrefer',
+                'ModelCatJustInt', 'PersDelayDays', 'FundDelayDays', 'BTDelayDays', 'ReqDelayDays', 'OthDelayDays',
+                'LCPDelayDays', 'LCPinit', 'LCPcomp', 'LCPrej', 'StatusTicket', 'StUpdate', 'ECD', 'SERD', 'Acode', 'Rcode',
+                'CPARstatus', 'CPARsubmit', 'LCPDate', 'noCPARreason', 'LCPSubmit', 'Attachments', 'cramuaTL', 'draftlcpvtTL',
+                'btTL', 'revisedlcpTL', 'cparsubTL', 'localpassTL', 'cparmgrpassTL', 'chengpassTL', 'muaTool', 'externalLCPNotes',
+                'CPARNotes', 'TEINotes', 'craChecklist', 'muaChecklist', 'lcgChecklist', "NMI'd", 'prevSub', 'NMIdBy',
+                'awaitingStatus', 'nextTask', 'miscChecklist', 'CompletedBy', 'itemCategory', 'CompString'
+            ];
+            const formFields = tableHeaders;
+            const personFields = ['POCname', 'Createdby', 'AssignEng', 'Reqname', 'CompletedBy', 'NMIdBy'];
+            const longTextFields = [
+                'ProbDesc', 'EngNotes', 'Resolution', 'TInotes', 'WorkNotes', 'StatusTicket', 'externalLCPNotes',
+                'CPARNotes', 'TEINotes', 'DelayReason', 'IntJust', 'ModelCatJustInt', 'noCPARreason'
+            ];
+
+            // Columns shown on the dashboard (summary view). Full detail is edited on its own page.
+            const dashboardColumns = [
+                'TrackingRef', 'Status', 'Priority', 'Phase', 'itemCategory', 'ProcType',
+                'TitleTicket', 'AssignEng', 'POCname', 'ShopNameTag', 'Approved', 'Closed', 'ECD'
+            ];
+
+            // Fields with a fixed, filterable dropdown on the dashboard.
+            const filterFieldMap = {
+                status: 'Status',
+                priority: 'Priority',
+                phase: 'Phase',
+                itemCategory: 'itemCategory',
+                procType: 'ProcType',
+                assignEng: 'AssignEng'
+            };
+            const searchFields = ['TrackingRef', 'TitleTicket', 'ProbDesc', 'POCname', 'AssignEng', 'ShopNameTag', 'TInomen', 'TImodel', 'Resolution'];
+
+            const tableHead = document.querySelector('#tbl_SS_Actions thead tr');
+            const tableBody = document.querySelector('#tbl_SS_Actions tbody');
+            const formGrid = document.querySelector('#item-form');
+            const addNewBtn = document.getElementById('add-new-btn');
+            const formTitle = document.getElementById('form-title');
+            const backToDashboardBtn = document.getElementById('back-to-dashboard-btn');
+            const cancelBtn = document.getElementById('cancel-btn');
+            const saveBtn = document.getElementById('save-btn');
+            const removeFromEditBtn = document.getElementById('remove-from-edit-btn');
+            const syncStatusEl = document.getElementById('sync-status');
+            const conflictDisplay = document.getElementById('conflict-display');
+            const conflictDetails = document.getElementById('conflict-details');
+            const ticketCountEl = document.getElementById('ticket-count');
+            const clearFiltersBtn = document.getElementById('clear-filters-btn');
+            const searchInput = document.getElementById('filter-search');
+
+            const navTabs = document.querySelectorAll('.nav-tab');
+            const views = {
+                dashboard: document.getElementById('view-dashboard'),
+                metrics: document.getElementById('view-metrics'),
+                edit: document.getElementById('view-edit')
+            };
+
+            let allItems = new Map();
+            let editingItemId = null;
+            let syncClient;
+            let peopleClient;
+            let filters = { search: '', status: '', priority: '', phase: '', itemCategory: '', procType: '', assignEng: '' };
+
+            function switchView(viewName) {
+                Object.keys(views).forEach(key => views[key].classList.toggle('active', key === viewName));
+                navTabs.forEach(tab => tab.classList.toggle('active', tab.dataset.view === viewName));
+                if (viewName === 'dashboard') {
+                    editingItemId = null;
+                }
+            }
+
+            function cssSlug(value) {
+                return String(value || '').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+            }
+
+            function getFieldText(item, field) {
+                const value = item[field];
+                if (personFields.includes(field) && value && typeof value === 'object') {
+                    return value.displayName || '';
+                }
+                return value == null ? '' : String(value);
+            }
+
+            function onRecordsChanged({ source, upserts, deletes }) {
+                deletes.forEach(deletedId => allItems.delete(deletedId));
+                upserts.forEach(record => allItems.set(record.ID, record));
+                populateFilterOptions();
+                renderDashboard();
+            }
+            function onStatusChange({ state, message }) {
+                syncStatusEl.textContent = `Sync Status: ${message}`;
+                syncStatusEl.style.backgroundColor = state === 'error' ? '#dc3545' : (state === 'ready' ? '#28a745' : '#6c757d');
+            }
+
+            function populateFilterOptions() {
+                const itemsArray = Array.from(allItems.values());
+                Object.keys(filterFieldMap).forEach(filterKey => {
+                    const field = filterFieldMap[filterKey];
+                    const select = document.getElementById(`filter-${filterKey}`);
+                    const currentValue = select.value;
+                    const distinctValues = new Set();
+                    itemsArray.forEach(item => {
+                        const text = getFieldText(item, field).trim();
+                        if (text) distinctValues.add(text);
+                    });
+                    const sorted = Array.from(distinctValues).sort((a, b) => a.localeCompare(b));
+                    const placeholderOption = select.options[0];
+                    select.innerHTML = '';
+                    select.appendChild(placeholderOption);
+                    sorted.forEach(value => {
+                        const option = document.createElement('option');
+                        option.value = value;
+                        option.textContent = value;
+                        select.appendChild(option);
+                    });
+                    if (sorted.includes(currentValue)) select.value = currentValue;
+                });
+            }
+
+            function matchesFilters(item) {
+                for (const filterKey of Object.keys(filterFieldMap)) {
+                    const activeValue = filters[filterKey];
+                    if (activeValue && getFieldText(item, filterFieldMap[filterKey]) !== activeValue) return false;
+                }
+                if (filters.search) {
+                    const haystack = searchFields.map(field => getFieldText(item, field)).join(' ').toLowerCase();
+                    if (!haystack.includes(filters.search)) return false;
+                }
+                return true;
+            }
+
+            function renderDashboard() {
+                const fullList = Array.from(allItems.values());
+                const filtered = fullList.filter(matchesFilters);
+                ticketCountEl.textContent = `${filtered.length} of ${fullList.length} tickets`;
+
+                tableBody.innerHTML = '';
+                if (filtered.length === 0) {
+                    tableBody.innerHTML = `<tr><td colspan="${dashboardColumns.length + 1}" style="text-align:center;">No tickets match the current filters.</td></tr>`;
+                    return;
+                }
+                filtered.sort((a, b) => (a.TrackingRef || '').localeCompare(b.TrackingRef || ''));
+                filtered.forEach(item => {
+                    const row = document.createElement('tr');
+                    row.dataset.id = item.ID;
+                    if (item._forgeConflicts) {
+                        row.classList.add('has-conflict');
+                    }
+
+                    let rowHTML = '';
+                    dashboardColumns.forEach(field => {
+                        const displayValue = getFieldText(item, field);
+                        if (field === 'Status') {
+                            rowHTML += `<td><span class="status-pill status-${cssSlug(displayValue)}">${displayValue || '—'}</span></td>`;
+                        } else if (field === 'Priority') {
+                            rowHTML += `<td><span class="priority-pill priority-${cssSlug(displayValue)}">${displayValue || '—'}</span></td>`;
+                        } else {
+                            rowHTML += `<td title="${displayValue}">${displayValue}</td>`;
+                        }
+                    });
+                    rowHTML += `
+                        <td class="actions">
+                            <button type="button" class="btn-edit" data-id="${item.ID}">Edit</button>
+                            <button type="button" class="btn-remove" data-id="${item.ID}">Remove</button>
+                        </td>`;
+                    row.innerHTML = rowHTML;
+                    tableBody.appendChild(row);
+                });
+            }
+
+            function openEditPage(title, item = null) {
+                formTitle.textContent = title;
+                conflictDisplay.style.display = 'none';
+                formFields.forEach(field => {
+                    const input = document.getElementById(`field-${field}`);
+                    input.value = '';
+                    if (item) {
+                       const value = item[field];
+                       if (personFields.includes(field) && value && typeof value === 'object') {
+                           input.value = value.displayName || '';
+                           input.dataset.person = JSON.stringify(value);
+                       } else {
+                           input.value = value || '';
+                       }
+                    } else {
+                        delete input.dataset.person;
+                    }
+                });
+                if (item) {
+                    editingItemId = item.ID;
+                    document.getElementById('field-ID').readOnly = true;
+                    removeFromEditBtn.style.display = '';
+                    if (item._forgeConflicts) {
+                        conflictDisplay.style.display = 'block';
+                        conflictDetails.innerHTML = `<pre>${JSON.stringify(item._forgeConflicts, null, 2)}</pre>`;
+                    }
+                } else {
+                    editingItemId = null;
+                    const newId = crypto.randomUUID();
+                    document.getElementById('field-ID').value = newId;
+                    document.getElementById('field-ID').readOnly = true;
+                    removeFromEditBtn.style.display = 'none';
+                }
+                switchView('edit');
+                document.getElementById('item-form-container').scrollTop = 0;
+            }
+
+            async function handleSave() {
+                const id = document.getElementById('field-ID').value;
+                let record = allItems.get(id) || { ID: id };
+                formFields.forEach(field => {
+                    const input = document.getElementById(`field-${field}`);
+                    if (personFields.includes(field) && input.dataset.person) {
+                        record[field] = JSON.parse(input.dataset.person);
+                    } else {
+                        record[field] = input.value;
+                    }
+                });
+
+                // Clear conflicts on save
+                delete record._forgeConflicts;
+
+                try {
+                    await syncClient.save(record);
+                } catch(e) {
+                    console.error("Save failed:", e);
+                    alert("Failed to save record. See console for details.");
+                    return;
+                }
+                switchView('dashboard');
+            }
+            function handleEdit(id) {
+                const item = allItems.get(id);
+                if (item) {
+                    openEditPage('Edit Item', item);
+                }
+            }
+            async function handleRemove(id) {
+                if (confirm('Are you sure you want to remove this item?')) {
+                     try {
+                        await syncClient.remove(id);
+                    } catch(e) {
+                        console.error("Remove failed:", e);
+                        alert("Failed to remove record. See console for details.");
+                    }
+                }
+            }
+            async function handleRemoveFromEdit() {
+                if (!editingItemId) return;
+                if (confirm('Are you sure you want to remove this item?')) {
+                    try {
+                        await syncClient.remove(editingItemId);
+                        switchView('dashboard');
+                    } catch(e) {
+                        console.error("Remove failed:", e);
+                        alert("Failed to remove record. See console for details.");
+                    }
+                }
+            }
+
+            async function init() {
+                formGrid.innerHTML = formFields.map(field => {
+                    const isLongText = longTextFields.includes(field);
+                    const control = isLongText
+                        ? `<textarea id="field-${field}" name="${field}" rows="4"></textarea>`
+                        : `<input type="text" id="field-${field}" name="${field}">`;
+                    return `
+                        <div class="form-group${isLongText ? ' full-width' : ''}">
+                            <label for="field-${field}">${field}</label>
+                            ${control}
+                        </div>
+                    `;
+                }).join('');
+                tableHead.innerHTML = dashboardColumns.map(h => `<th>${h}</th>`).join('') + '<th>Actions</th>';
+
+                navTabs.forEach(tab => {
+                    tab.addEventListener('click', () => switchView(tab.dataset.view));
+                });
+
+                addNewBtn.addEventListener('click', () => openEditPage('Add New Item'));
+                saveBtn.addEventListener('click', handleSave);
+                cancelBtn.addEventListener('click', () => switchView('dashboard'));
+                backToDashboardBtn.addEventListener('click', () => switchView('dashboard'));
+                removeFromEditBtn.addEventListener('click', handleRemoveFromEdit);
+
+                tableBody.addEventListener('click', (event) => {
+                    const target = event.target;
+                    if (target.classList.contains('btn-edit')) {
+                        handleEdit(target.dataset.id);
+                    } else if (target.classList.contains('btn-remove')) {
+                        handleRemove(target.dataset.id);
+                    }
+                });
+
+                searchInput.addEventListener('input', (event) => {
+                    filters.search = event.target.value.trim().toLowerCase();
+                    renderDashboard();
+                });
+                Object.keys(filterFieldMap).forEach(filterKey => {
+                    document.getElementById(`filter-${filterKey}`).addEventListener('change', (event) => {
+                        filters[filterKey] = event.target.value;
+                        renderDashboard();
+                    });
+                });
+                clearFiltersBtn.addEventListener('click', () => {
+                    filters = { search: '', status: '', priority: '', phase: '', itemCategory: '', procType: '', assignEng: '' };
+                    searchInput.value = '';
+                    Object.keys(filterFieldMap).forEach(filterKey => {
+                        document.getElementById(`filter-${filterKey}`).value = '';
+                    });
+                    renderDashboard();
+                });
+
+                try {
+                    peopleClient = await ForgeSharePointSync.createPeopleClient();
+                    personFields.forEach(field => {
+                        const input = document.getElementById(`field-${field}`);
+                        if(input) {
+                            peopleClient.attachAutocomplete(input, {
+                                onSelect: (person) => {
+                                    input.dataset.person = JSON.stringify(person);
+                                }
+                            });
+                        }
+                    });
+                } catch(e) {
+                    console.error("Could not initialize People Client:", e);
+                    onStatusChange({state: 'error', message: 'People Client Failed'});
+                }
+                try {
+                    syncClient = await ForgeSharePointSync.create({
+                        listTitle: 'tbl_SS_Actions_Data_a1b2c3d4e5',
+                        itemType: 'tbl_SS_Actions_Item',
+                        getRecordId: (record) => record.ID,
+                        onRecordsChanged,
+                        onStatusChange,
+                    });
+                    await syncClient.start();
+                } catch(e) {
+                    console.error("Could not initialize SharePoint Sync:", e);
+                    onStatusChange({state: 'error', message: 'Sync Failed To Start'});
+                }
+
+                populateFilterOptions();
+                renderDashboard();
+            }
+            init();
+        });
+    </script>
+<!-- <script src="testRecorder.js"></script> -->
+</body>
+</html>

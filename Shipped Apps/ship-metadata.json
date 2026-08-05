@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "currentVersion": "1.0",
+  "releases": [
+    {
+      "version": "1.0",
+      "releaseType": "feature",
+      "releaseTypeLabel": "Minor feature add",
+      "filename": "NewSSDashboard - Only Secure in FS Sharepoint-current.html",
+      "hash": "a7f09434c2c705b568ecc6bdde087dcf4546d9fcf9b7f4643ae3dba294d0c2c8",
+      "shipTarget": "sharepoint",
+      "shippedAt": "2026-08-05T22:41:15.113Z"
+    }
+  ]
+}
